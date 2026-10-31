@@ -1,7 +1,10 @@
 # roc-websocket: design and platform analysis
 
-Status: design only. Optional features are plain adapter fields (3.2-3.3, 3.6). Nothing here is implemented except the probes in `probes/`,
-which type-check the proposed surface against all three platforms (section 9).
+Status: version 0.1 is implemented in `src/` (shared types, pure core, byte-level
+client) with a basic-webserver adapter in the sibling repo
+`roc-basic-webserver-websocket`. Section 0 lists what the implementation settled or
+changed; where it disagrees with a later section, section 0 wins. The rest is the
+original analysis, kept for its platform findings and citations.
 
 Citations are `file:line`. Paths are abbreviated:
 
@@ -14,6 +17,118 @@ Citations are `file:line`. Paths are abbreviated:
 | `Builtin.roc` | `/home/george/dev/Karakatiza666/roc/src/build/roc/Builtin.roc` |
 
 "Inference" marks a claim that was not read in code or verified by a probe.
+
+---
+
+## 0. Implementation (version 0.1): settled and changed decisions
+
+### 0.1 Modules
+
+| Module | Contents |
+| --- | --- |
+| `Ws` | `Message`, `Closure`, `Request`, `Opened(c)`, `AcceptOptions`; the feature aliases; the pre-composed aliases; `messages` (a `Stream` of a connection's messages), `dropped` |
+| `Frame` | `Frame := { fin, opcode, payload }` (`is_eq` derived), `Opcode`, `Masking`, `Expect`, `Header`; `encode`, `header`, `decode`, `mask`, `fragments`, constructors |
+| `CloseCode` | named codes, `is_sendable` (1000-1003, 1007-1014, 3000-4999), `payload`, `parse` |
+| `Base64`, `Sha1` | encode/decode; SHA-1 (FIPS 180-4) |
+| `Handshake` | `parse_url`, `client_request`, `check_response` (status, Upgrade, Connection, Sec-WebSocket-Accept, no extensions, offered subprotocol only), `parse_upgrade`, `accept_response`, `choose_protocol`, `rejection` (400/405/426), `accept_key`, `head_wanted` |
+| `Protocol` | sans-IO receive state machine: `new`, `receive : Protocol, List(U8) -> (Protocol, List(Event))`, `close`, `ended`, `wanted`, `is_idle`, `is_open`, `is_done`, `masking`. Both roles |
+| `Client` | `open! : Client.Link(e), Ws.Request => Try(Ws.Opened(Client.Conn(e)), ...)`, the byte-level client |
+
+`Assembler` and `Mask` (section 4) are not separate modules: assembly is part of
+`Protocol`, masking is `Frame.mask`.
+
+### 0.2 Errors: one row shape everywhere (changes 3.2, 3.3, 3.6)
+
+Every effectful field of every alias returns `Try(_, [Closed(Ws.Closure), ..e])`,
+with the same `e` in every field of an adapter, including the input features
+`Bytes` and `Random`. The earlier aliases gave some fields their own fixed tags
+(`close! : ... [..e]`, `ping! : ... [Closed, ControlTooLong, ..e]`,
+`ReceiveWithin` with `[TimedOut, Closed, ..e]`). That does not work in code that is
+generic in `e`, verified with this compiler:
+
+- A rigid row cannot be widened: a value of `[..e]` (a link's write error) is
+  rejected where `[Closed(Closure), BadFrame(Str), ..e]` is expected, and a match
+  arm `Err(other) => Err(other)` keeps the full type (the known narrowing limit,
+  3.6 item 2, also holds for widening).
+- A tag may not appear both as a fixed tag of an alias and inside the row passed
+  to it: `Core([Closed(U16), Io(Str)], {})` with `Core`'s own `Closed(U16)` is a
+  type mismatch reported as "the annotation says it should be: `[]`".
+
+So a failure a feature adds is a tag of `e` by documented convention:
+`InvalidClose(Str)`, `ControlTooLong(U64)`, `BadFrame(Str)`, `TooLarge(U64)`,
+`TimedOut`, `Refused(Str)`, `NotUpgrade(Str)`. The pure client fixes its tags in
+`Client.Errors(e) = [TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]`
+and requires the link's row to be `Client.Errors(e)` too, so link errors flow
+into the connection's errors with no mapping. A platform adds only its own tags
+(basic-webserver: `[Tcp(Str), Connect(Str), Entropy(Str)]`). `Closed` is still
+the one shared tag (Q6 settled). Where an outcome is not a failure it is in the
+`Ok` side: `ReceiveWithin` gives `Ok(TimedOut)`, `Persist.saved!` gives
+`Ok(Nothing)`.
+
+### 0.3 `close!` runs the whole closing handshake (changes 3.2)
+
+`close! : U16, Str => Try(Ws.Closure, [Closed(Ws.Closure), ..e])` sends Close,
+waits for the peer's Close (dropping messages in between) and returns the
+closure, `by: Us`. A Roc closure cannot keep state between calls, so a
+byte-level connection cannot remember that it sent Close and finish the
+handshake in a later `receive!`; the message-level platforms can implement the
+same contract (close, then receive until closed). The push-model `Sender.close!`
+only starts the close, since its end arrives as a callback.
+
+### 0.4 The client keeps no state between calls
+
+Every read asks for at most `Protocol.wanted` bytes (`read_up_to!(n)` gives 1 to
+`n`), and the response head is read with `Handshake.head_wanted` (at most 4
+bytes per read, never past `\r\n\r\n`), so no byte of the next frame is ever
+read early and each call starts from a fresh `Protocol`. Consequences: a
+fragmented message and its interleaved control frames are assembled within one
+`receive!`; a link `TimedOut` between messages is returned to the caller (the
+connection stays usable), and inside a frame or a fragmented message the client
+keeps reading; after `receive!` returned `Closed`, a later call sees the end of
+the stream (`Closed` with 1006). The `Protocol` state machine itself is
+persistent and suits a driver that can keep state (a future host-parked
+platform, or a server loop).
+
+### 0.5 Features (changes 3.3; generic, not shaped by one platform)
+
+Each alias describes a feature as it appears on any platform that has it:
+`Core`, `Sender`, `Ping`, `Pong`, `Frames`, `ReceiveWithin`, `Buffered`,
+`AutoResponse` (a fixed text reply the runtime sends by itself), `Persist`
+(per-connection state that survives the server leaving memory), `Topics`
+(publish/subscribe groups), `Dial`, `Accept`, `Handlers`, and the required inputs
+`Bytes` and `Random`. Dropped or generalized from 3.3: `Hibernation` became
+`Persist` without tags (connection tags are a Workers notion; the general
+grouping feature is `Topics`); `AutoResponse` lost `auto_response_ms!`
+(a Workers timestamp). WebSocketPair and Durable-Object specifics stay in the
+Cloudflare adapter. Negotiated values stay values: `Opened(c) = { conn, protocol, extensions }`.
+
+Pre-composed aliases: `Basic(e)`, `Raw(e)` (core, ping, pong, frames: what the
+byte-level client gives), `Timed(e)`, `Push(e)`, `Transport(e)` (bytes and
+randomness); the client adds `Client.Conn(e)` and `Client.Link(e)`.
+
+### 0.6 Adapters are packages (Q1 settled)
+
+An adapter is a separate package that depends on its platform and on
+roc-websocket (`roc-basic-webserver-websocket`; a Cloudflare one later, which uses
+no pure core). A package that names a platform works when the app names the
+identical platform URL.
+
+### 0.7 Randomness (Q4 settled)
+
+Randomness is a required input feature, `Ws.Random(e, r)`, implemented by each
+adapter: 16 bytes for the key, 4 per frame for the mask, both from the platform.
+basic-webserver has no random effect; its adapter reads `/dev/urandom` with
+`File.open_reader_with_capacity!`/`read_line!` (the only file read it has is by
+line), drops the newline, hashes at least 48 bytes (each uniform over 255 values,
+over 383 bits) with `Crypto.SHA256` and uses the 32-byte digest. Unix only.
+
+### 0.8 Not done in 0.1
+
+A server driver (`accept!` over bytes for basic-cli; the pure parts, `Handshake.parse_upgrade`,
+`accept_response` and `Protocol` in the `Server` role, are done and tested), `drive!`
+from pull to push, a basic-cli adapter, the Cloudflare adapter, `wss://`, and
+sending a message in fragments by size (the caller uses `Frame.fragments` with
+`send_frame!`).
 
 ---
 
