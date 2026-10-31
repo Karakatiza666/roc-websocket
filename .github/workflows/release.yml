@@ -1,0 +1,76 @@
+# On a tag X.Y.Z (or X.Y.Z-pre): run the tests, make the bundle, publish the GitHub Release with
+# the bundle and the docs, then run the examples against the published URL.
+name: Release
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+permissions: {}
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yaml
+    permissions: { contents: read }
+  release:
+    needs: tests
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    outputs:
+      url: ${{ steps.publish.outputs.url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || [[ "$TAG" == 0.0.0* ]]; then
+            echo "The tag must be X.Y.Z or X.Y.Z-pre, not 0.0.0: $TAG" >&2
+            exit 1
+          fi
+      - uses: ./.github/actions/setup-roc
+        with: { token: "${{ github.token }}" }
+      - name: Bundle and docs
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          scripts/bundle.sh "$TAG" | tee bundle.txt
+          roc docs src/main.roc --output=generated-docs
+          tar czf dist/package-docs.tar.gz -C generated-docs .
+      - name: Publish
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          url=$(sed -n 's/^url: //p' bundle.txt)
+          nightly=$(tr -d '\r\n' < .roc-version)
+          pre=()
+          [[ "$TAG" == *-* ]] && pre=(--prerelease)
+          {
+            echo "Add the package to the header of your app or package:"
+            echo
+            echo '```roc'
+            echo "ws: \"$url\""
+            echo '```'
+            echo
+            echo "Built and tested with Roc \`$nightly\`."
+          } > notes.md
+          gh release create "$TAG" dist/*.tar.zst dist/package-docs.tar.gz \
+            --title "$TAG" --notes-file notes.md --verify-tag "${pre[@]}"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+  test-published:
+    needs: release
+    runs-on: ${{ matrix.os }}
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-roc
+        with: { token: "${{ github.token }}" }
+      - run: ROC_CACHE_DIR="$RUNNER_TEMP/roc-cache" scripts/test_bundle.sh "${{ needs.release.outputs.url }}"

@@ -5,43 +5,189 @@ import Protocol
 
 ## A WebSocket client over a byte stream, for platforms where Roc owns the
 ## wire (TCP). The platform adapter connects the stream and gives
-## `Client.open!` a `Ws.Transport`-shaped record; the client does the
-## handshake, framing, masking, fragment assembly, Ping replies and the
-## closing handshake.
+## `Client.open!` its `Client.Link` operations and link value `b`; the
+## client does the handshake, framing, masking, fragment assembly, Ping
+## replies and the closing handshake.
 ##
-## The connection keeps no state between calls: every read takes exactly
-## the bytes of the current frame, so nothing is left over between
-## messages. As a result, once `receive!` has returned `Closed`, a later
-## call sees the end of the stream and returns `Closed` with code 1006.
+## A `Client.Conn` is a value: each call returns the updated connection, which
+## keeps the bytes read past the current frame, a half-received message, the
+## messages of one read not yet delivered, and a pending close.
 Client :: [].{
 
-	## The tags the client adds to the platform's row `e`. `TimedOut` comes
-	## from the link: a read that gave up on a deadline. Between messages the
-	## client returns it; inside a frame or a fragmented message it keeps
-	## reading, since the partial state would be lost.
-	Errors(e) : [TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
+	## The tags the client adds to the platform's row `e`.
+	Errors(e) : [Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
 
-	## A connection from `Client.open!`.
-	Conn(e) : Ws.Raw(Client.Errors(e))
+	## Every error of a client call: `Closed` and `Client.Errors(e)`.
+	Error(e) : [Closed(Ws.Closure), Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
 
-	## What `Client.open!` needs: a connected byte stream and randomness, whose
-	## errors are the platform's row with the client's tags.
-	Link(e) : Ws.Transport(Client.Errors(e))
+	## What `Client.open!` needs: a byte stream and randomness over one link
+	## value `b`, whose errors are the platform's row with the client's tags.
+	Link(b, e) : Ws.Transport(b, Client.Errors(e))
+
+	## The operations of a client connection as a record, for code generic
+	## over features: the core, ping, pong, frames and poll.
+	Ops(b, e) : Ws.Core(Client.Conn(b, e), Client.Errors(e), Ws.Ping(Client.Conn(b, e), Client.Errors(e), Ws.Pong(Client.Conn(b, e), Client.Errors(e), Ws.Frames(Client.Conn(b, e), Client.Errors(e), Ws.Poll(Client.Conn(b, e), Client.Errors(e), {})))))
+
+	## An open client connection over the link value `b`.
+	Conn(b, e) := { ops : Client.Link(b, e), link : b, protocol : Protocol, inbox : List(Ws.Message) }.{
+
+		## Send one message, in one frame.
+		send! : Client.Conn(b, e), Ws.Message => Try(Client.Conn(b, e), Client.Error(e))
+		send! = |conn, message| {
+			usable(conn)?
+			write_frame!(
+				conn,
+				match message {
+					Text(s) => Frame.text(s)
+					Binary(b) => Frame.binary(b)
+				},
+			)
+		}
+
+		## The next message. A platform read deadline passing is not reported:
+		## `receive!` keeps waiting (see `poll!`). After `close!`, it delivers
+		## the messages on their way and ends with `Closed({ by: Us, .. })`.
+		receive! : Client.Conn(b, e) => Try((Client.Conn(b, e), Ws.Message), Client.Error(e))
+		receive! = |conn| {
+			var $c = conn
+			while Bool.True {
+				match next_ready($c) {
+					Ok((ready, m)) => return Ok((ready, m))
+					Err(Ended(closure)) => return Err(Closed(closure))
+					Err(Empty) => {}
+				}
+				(after, _) = step!($c)?
+				$c = after
+			}
+		}
+
+		## The next message, or `Idle` when the platform's read deadline passed
+		## with no message (30 s on basic-webserver). Nothing is lost.
+		poll! : Client.Conn(b, e) => Try((Client.Conn(b, e), [Message(Ws.Message), Idle]), Client.Error(e))
+		poll! = |conn| {
+			var $c = conn
+			while Bool.True {
+				match next_ready($c) {
+					Ok((ready, m)) => return Ok((ready, Message(m)))
+					Err(Ended(closure)) => return Err(Closed(closure))
+					Err(Empty) => {}
+				}
+				(after, progress) = step!($c)?
+				if progress == Idle {
+					return Ok((after, Idle))
+				}
+				$c = after
+			}
+		}
+
+		## Start the closing handshake: send Close and return. A code that may
+		## not be sent or a reason over 123 bytes is `InvalidClose`.
+		close! : Client.Conn(b, e), U16, Str => Try(Client.Conn(b, e), Client.Error(e))
+		close! = |conn, code, reason| {
+			usable(conn)?
+			match conn.protocol.close(code, reason) {
+				Ok((protocol, frame)) => write_frame!({ ..conn, protocol }, frame)
+				Err(InvalidCode(c)) => Err(InvalidClose("the close code ${c.to_str()} may not be sent"))
+				Err(ReasonTooLong(n)) => Err(InvalidClose("a close reason of ${n.to_str()} bytes; at most 123"))
+				Err(NotOpen) => crash "Client.close!: usable checked that the connection is open"
+			}
+		}
+
+		## Send a Ping, payload at most 125 bytes.
+		ping! : Client.Conn(b, e), List(U8) => Try(Client.Conn(b, e), Client.Error(e))
+		ping! = |conn, payload| {
+			usable(conn)?
+			write_frame!(conn, Frame.ping(payload))
+		}
+
+		## Send an unsolicited Pong, payload at most 125 bytes.
+		pong! : Client.Conn(b, e), List(U8) => Try(Client.Conn(b, e), Client.Error(e))
+		pong! = |conn, payload| {
+			usable(conn)?
+			write_frame!(conn, Frame.pong(payload))
+		}
+
+		## Send any frame, masked. A frame that breaks RFC 6455 is `BadFrame`.
+		send_frame! : Client.Conn(b, e), Frame => Try(Client.Conn(b, e), Client.Error(e))
+		send_frame! = |conn, frame| {
+			usable(conn)?
+			write_frame!(conn, frame)
+		}
+
+		## The next frame as it arrives: no assembly, no reply. Do not mix it
+		## with `receive!` inside a fragmented message.
+		receive_frame! : Client.Conn(b, e) => Try((Client.Conn(b, e), Frame), Client.Error(e))
+		receive_frame! = |conn| {
+			var $c = conn
+			while Bool.True {
+				match $c.protocol.closure() {
+					Ok(closure) => return Err(Closed(closure))
+					Err(NotDone) => {}
+				}
+				match $c.protocol.take_frame() {
+					Ok((protocol, frame)) => return Ok(({ ..$c, protocol }, frame))
+					Err(Invalid(why)) => {
+						$c = apply_events!($c, $c.protocol.fail(1002, why))?
+					}
+					Err(Incomplete(_)) => {
+						max = $c.protocol.max_message()
+						too_big = match Frame.header($c.protocol.pending_bytes(), ExpectUnmasked) {
+							Ok(h) => h.length > max
+							Err(_) => Bool.False
+						}
+						if too_big {
+							$c = apply_events!($c, $c.protocol.fail(1009, "a frame of more than ${max.to_str()} bytes"))?
+						} else {
+							(link, got) = ($c.ops.read_up_to!)($c.link, read_size)?
+							match got {
+								Data(bytes) => {
+									$c = { ..$c, link, protocol: $c.protocol.push(bytes) }
+								}
+								End => {
+									$c = { ..$c, link, protocol: $c.protocol.ended().0 }
+								}
+								TimedOut => {
+									$c = { ..$c, link }
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	## The bytes asked for in one read.
+	read_size : U64
+	read_size = 65536
 
 	## The largest message accepted when the request does not say: 16 MiB.
 	default_max_message : U64
 	default_max_message = 16 * 1024 * 1024
 
-	## Do the opening handshake over a connected byte stream and return the
+	## The operations as a record, for code generic over features.
+	ops : {} -> Client.Ops(b, e)
+	ops = |{}| {
+		send!: |c, m| c.send!(m),
+		receive!: |c| c.receive!(),
+		close!: |c, code, reason| c.close!(code, reason),
+		ping!: |c, p| c.ping!(p),
+		pong!: |c, p| c.pong!(p),
+		send_frame!: |c, f| c.send_frame!(f),
+		receive_frame!: |c| c.receive_frame!(),
+		poll!: |c| c.poll!(),
+	}
+
+	## Do the opening handshake over a connected link and return the
 	## connection. `request.url` gives the `Host` header and the resource; the
 	## adapter has already connected to its host and port (and done TLS for
-	## `wss://`). The server refusing the upgrade, or ending the stream during
-	## it, is `Refused`.
-	open! : Client.Link(e), Ws.Request => Try(Ws.Opened(Client.Conn(e)), [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-	open! = |link, request| {
+	## `wss://`). A refused upgrade, the stream ending during it, or no answer
+	## before the platform's read deadline is `Refused`.
+	open! : Client.Link(b, e), b, Ws.Request => Try(Ws.Opened(Client.Conn(b, e)), Client.Error(e))
+	open! = |link_ops, link0, request| {
 		url = Handshake.parse_url(request.url).map_err(|BadUrl(why)| Refused(why))?
 		max_message = request.?max_message ?? Client.default_max_message
-		key = (link.random_bytes!)(16)?
+		(link1, key) = (link_ops.random_bytes!)(link0, 16)?
 		client_request = {
 			url,
 			key,
@@ -52,29 +198,11 @@ Client :: [].{
 			Ok(text) => text
 			Err(BadKey(n)) => crash "Client.open!: random_bytes!(16) gave ${n.to_str()} bytes"
 		}
-		(link.write_bytes!)(head.to_utf8())?
-		response = read_head!(link)?
+		link2 = (link_ops.write_bytes!)(link1, head.to_utf8())?
+		(link3, response, rest) = read_head!(link_ops, link2)?
 		agreed = Handshake.check_response(response, client_request)?
-		conn = {
-			send!: |message| write_frame!(
-				link,
-				match message {
-					Text(s) => Frame.text(s)
-					Binary(b) => Frame.binary(b)
-				},
-			),
-			receive!: |{}| receive!(link, max_message),
-			close!: |code, reason| close!(link, max_message, code, reason),
-			ping!: |payload| control!(link, Frame.ping(payload)),
-			pong!: |payload| control!(link, Frame.pong(payload)),
-			send_frame!: |frame| match Frame.encode(frame, Masked([0, 0, 0, 0])) {
-				Ok(_) => write_frame!(link, frame)
-				Err(ControlTooLong(n)) => Err(BadFrame("a control frame of ${n.to_str()} bytes"))
-				Err(FragmentedControl) => Err(BadFrame("a fragmented control frame"))
-				Err(BadMask(_)) => crash "Client: a 4-byte mask"
-			},
-			receive_frame!: |{}| receive_frame!(link, max_message),
-		}
+		start = Conn.{ ops: link_ops, link: link3, protocol: Protocol.new(Client, max_message), inbox: [] }
+		conn = apply_events!(start, start.protocol.receive(rest))?
 		Ok({ conn, protocol: agreed.protocol, extensions: agreed.extensions })
 	}
 }
@@ -83,150 +211,116 @@ Client :: [].{
 max_head : U64
 max_head = 16384
 
-## The response head, read without taking any byte after it.
-read_head! : Client.Link(e) => Try(Str, [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-read_head! = |link| {
-	var $head = []
-	while Bool.True {
-		n = Handshake.head_wanted($head)
-		if n == 0 {
-			break
-		}
-		if $head.len() > max_head {
-			return Err(Refused("a response head of more than ${max_head.to_str()} bytes"))
-		}
-		bytes = (link.read_up_to!)(n)?
-		if bytes.is_empty() {
-			return Err(Refused("the server ended the connection during the handshake"))
-		}
-		$head = $head.concat(bytes)
-	}
-	Str.from_utf8($head).map_err(|_| Refused("a response head that is not UTF-8"))
-}
-
-## Mask and write one frame. The frame is valid (checked by the caller).
-write_frame! : Client.Link(e), Frame => Try({}, [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-write_frame! = |link, frame| {
-	key = (link.random_bytes!)(4)?
-	match Frame.encode(frame, Masked(key)) {
-		Ok(bytes) => (link.write_bytes!)(bytes)
-		Err(BadMask(n)) => crash "Client: random_bytes!(4) gave ${n.to_str()} bytes"
-		Err(ControlTooLong(n)) => Err(ControlTooLong(n))
-		Err(FragmentedControl) => Err(BadFrame("a fragmented control frame"))
-	}
-}
-
-control! : Client.Link(e), Frame => Try({}, [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-control! = |link, frame|
-	if frame.payload.len() > 125 {
-		Err(ControlTooLong(frame.payload.len()))
-	} else {
-		write_frame!(link, frame)
-	}
-
-## The next message. A timeout between messages is `Err(TimedOut)` and loses
-## nothing; a timeout inside a frame or a fragmented message keeps waiting,
-## since the partial state would be lost.
-receive! : Client.Link(e), U64 => Try(Ws.Message, [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-receive! = |link, max_message| {
-	var $p = Protocol.new(Client, max_message)
-	while Bool.True {
-		match (link.read_up_to!)($p.wanted()) {
-			Ok([]) => return Err(Closed(Ws.dropped))
-			Ok(bytes) => {
-				(next, events) = $p.receive(bytes)
-				$p = next
-				for event in events {
-					match event {
-						Write(frame) => write_frame!(link, frame)?
-						Message(m) => return Ok(m)
-						Closed(c) => return Err(Closed(c))
-						Ping(_) => {}
-						Pong(_) => {}
-					}
-				}
-			}
-			Err(TimedOut) =>
-				if $p.is_idle() {
-					return Err(TimedOut)
-				}
-			Err(other) => return Err(other)
-		}
-	}
-}
-
-## Send a Close and read until the peer's Close, dropping messages. A
-## timeout or the end of the stream before the peer's Close ends it as
-## unclean (1006).
-close! : Client.Link(e), U64, U16, Str => Try(Ws.Closure, [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-close! = |link, max_message, code, reason| {
-	(started, frame) = match Protocol.new(Client, max_message).close(code, reason) {
-		Ok(pair) => pair
-		Err(InvalidCode(c)) => return Err(InvalidClose("the close code ${c.to_str()} may not be sent"))
-		Err(ReasonTooLong(n)) => return Err(InvalidClose("a close reason of ${n.to_str()} bytes; at most 123"))
-		Err(NotOpen) => crash "Client.close!: a new protocol is open"
-	}
-	write_frame!(link, frame)?
-	unclean = { code: 1006, reason: "", clean: Bool.False, by: Us }
-	var $p = started
-	while Bool.True {
-		match (link.read_up_to!)($p.wanted()) {
-			Ok([]) => return Ok(unclean)
-			Ok(bytes) => {
-				(next, events) = $p.receive(bytes)
-				$p = next
-				for event in events {
-					match event {
-						Write(f) => write_frame!(link, f)?
-						Closed(c) => return Ok(c)
-						Message(_) => {}
-						Ping(_) => {}
-						Pong(_) => {}
-					}
-				}
-			}
-			Err(TimedOut) => return Ok(unclean)
-			Err(other) => return Err(other)
-		}
-	}
-}
-
-## The next frame as it is, with no assembly and no reply. A frame that
-## breaks the protocol fails the connection with 1002.
-receive_frame! : Client.Link(e), U64 => Try(Frame, [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-receive_frame! = |link, max_message| {
+## The response head, and the bytes read after it.
+read_head! : Client.Link(b, e), b => Try((b, Str, List(U8)), Client.Error(e))
+read_head! = |ops, link| {
+	var $link = link
 	var $have = []
 	while Bool.True {
-		match Frame.decode($have, ExpectUnmasked) {
-			Ok({ frame, .. }) => return Ok(frame)
-			Err(Invalid(why)) => return fail_frames!(link, 1002, why)
-			Err(Incomplete(n)) => {
-				match Frame.header($have, ExpectUnmasked) {
-					Ok(h) if h.length > max_message => return fail_frames!(link, 1009, "a frame of more than ${max_message.to_str()} bytes")
-					_ => {}
+		match head_end($have) {
+			Ok(end) =>
+				match Str.from_utf8($have.take_first(end)) {
+					Ok(head) => return Ok(($link, head, $have.drop_first(end)))
+					Err(_) => return Err(Refused("a response head that is not UTF-8"))
 				}
-				match (link.read_up_to!)(n - $have.len()) {
-					Ok([]) => return Err(Closed(Ws.dropped))
-					Ok(bytes) => {
-						$have = $have.concat(bytes)
-					}
-					Err(TimedOut) =>
-						if $have.is_empty() {
-							return Err(TimedOut)
-						}
-					Err(other) => return Err(other)
-				}
+			Err(NotFound) => {}
+		}
+		if $have.len() > max_head {
+			return Err(Refused("a response head of more than ${max_head.to_str()} bytes"))
+		}
+		(next, got) = (ops.read_up_to!)($link, Client.read_size)?
+		$link = next
+		match got {
+			Data(bytes) => {
+				$have = $have.concat(bytes)
 			}
+			End => return Err(Refused("the server ended the connection during the handshake"))
+			TimedOut => return Err(Refused("no handshake response before the platform's read deadline"))
 		}
 	}
 }
 
-fail_frames! : Client.Link(e), U16, Str => Try(Frame, [Closed(Ws.Closure), TimedOut, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e])
-fail_frames! = |link, code, why| {
-	(_, frame) = match Protocol.new(Client, 0).close(code, why) {
-		Ok(pair) => pair
-		Err(_) => crash "Client: a valid failure code"
+## The index just after the first `\r\n\r\n`.
+head_end : List(U8) -> Try(U64, [NotFound])
+head_end = |bytes| {
+	n = bytes.len()
+	var $i = 0
+	while $i + 4 <= n {
+		if bytes.sublist({ start: $i, len: 4 }) == [13, 10, 13, 10] {
+			return Ok($i + 4)
+		}
+		$i = $i + 1
 	}
-	write_frame!(link, frame)?
-	Err(Closed({ code, reason: why, clean: Bool.False, by: Us }))
+	Err(NotFound)
+}
+
+## Fail when the connection has ended or this endpoint already sent Close.
+usable : Client.Conn(b, e) -> Try({}, Client.Error(e))
+usable = |conn| match conn.protocol.closure() {
+	Ok(closure) => Err(Closed(closure))
+	Err(NotDone) =>
+		match conn.protocol.closing() {
+			Ok({ code, reason }) => Err(Closed({ code, reason, clean: Bool.False, by: Us }))
+			Err(NotClosing) => Ok({})
+		}
+}
+
+## A message already received, or why there is none.
+next_ready : Client.Conn(b, e) -> Try((Client.Conn(b, e), Ws.Message), [Ended(Ws.Closure), Empty])
+next_ready = |conn| match conn.inbox {
+	[m, .. as rest] => Ok(({ ..conn, inbox: rest }, m))
+	[] =>
+		match conn.protocol.closure() {
+			Ok(closure) => Err(Ended(closure))
+			Err(NotDone) => Err(Empty)
+		}
+}
+
+## One read, fed to the protocol.
+step! : Client.Conn(b, e) => Try((Client.Conn(b, e), [Progress, Idle]), Client.Error(e))
+step! = |conn| {
+	(link, got) = (conn.ops.read_up_to!)(conn.link, Client.read_size)?
+	read = { ..conn, link }
+	match got {
+		Data(bytes) => {
+			done = apply_events!(read, read.protocol.receive(bytes))?
+			Ok((done, Progress))
+		}
+		End => Ok(({ ..read, protocol: read.protocol.ended().0 }, Progress))
+		TimedOut => Ok((read, Idle))
+	}
+}
+
+## Write the frames the protocol asked for and keep its messages.
+apply_events! : Client.Conn(b, e), (Protocol, List(Protocol.Event)) => Try(Client.Conn(b, e), Client.Error(e))
+apply_events! = |conn, (protocol, events)| {
+	var $c = { ..conn, protocol }
+	for event in events {
+		match event {
+			Write(frame) => {
+				$c = write_frame!($c, frame)?
+			}
+			Message(m) => {
+				$c = { ..$c, inbox: $c.inbox.append(m) }
+			}
+			Closed(_) => {}
+			Ping(_) => {}
+			Pong(_) => {}
+		}
+	}
+	Ok($c)
+}
+
+## Mask and write one frame.
+write_frame! : Client.Conn(b, e), Frame => Try(Client.Conn(b, e), Client.Error(e))
+write_frame! = |conn, frame| {
+	(link1, key) = (conn.ops.random_bytes!)(conn.link, 4)?
+	bytes = match Frame.encode(frame, Masked(key)) {
+		Ok(b) => b
+		Err(BadMask(n)) => crash "Client: random_bytes!(4) gave ${n.to_str()} bytes"
+		Err(ControlTooLong(n)) => return Err(ControlTooLong(n))
+		Err(FragmentedControl) => return Err(BadFrame("a fragmented control frame"))
+	}
+	link2 = (conn.ops.write_bytes!)(link1, bytes)?
+	Ok({ ..conn, link: link2 })
 }

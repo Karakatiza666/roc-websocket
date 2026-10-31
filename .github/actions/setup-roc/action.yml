@@ -1,0 +1,42 @@
+name: Set up Roc
+description: Download the Roc nightly of .roc-version (or of the input) from roc-lang/nightlies, and put roc on the PATH
+inputs:
+  nightly-tag:
+    description: A tag of roc-lang/nightlies in place of .roc-version, to test a compiler update
+    required: false
+    default: ""
+  token:
+    description: Token for gh release download
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Roc
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        OVERRIDE: ${{ inputs.nightly-tag }}
+      run: |
+        set -euo pipefail
+        tag="${OVERRIDE:-$(tr -d '\r\n' < .roc-version)}"
+        if [[ ! "$tag" =~ ^nightly-[0-9]{4}-([A-Za-z]+|[0-9]{2})-[0-9]{2}-[0-9a-f]{7,40}$ ]]; then
+          echo "Invalid Roc nightly tag: $tag" >&2
+          exit 1
+        fi
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) plat=linux_x86_64 ;;
+          Linux-aarch64) plat=linux_arm64 ;;
+          Darwin-arm64) plat=macos_apple_silicon ;;
+          Darwin-x86_64) plat=macos_x86_64 ;;
+          *) echo "no nightly for $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+        esac
+        dl="$RUNNER_TEMP/roc-download"
+        dir="$RUNNER_TEMP/roc"
+        mkdir -p "$dl" "$dir"
+        gh release download "$tag" -R roc-lang/nightlies -p "roc_nightly-${plat}-*.tar.gz" -D "$dl"
+        tar xzf "$dl"/*.tar.gz -C "$dl"
+        mv "$(find "$dl" -name roc -type f)" "$dir/roc"
+        chmod +x "$dir/roc"
+        echo "$dir" >> "$GITHUB_PATH"
+    - shell: bash
+      run: roc version

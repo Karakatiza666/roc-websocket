@@ -1,0 +1,45 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      roc-nightly:
+        description: A tag of roc-lang/nightlies in place of .roc-version
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      roc-nightly: { required: false, type: string, default: "" }
+permissions: {}
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-roc
+        with: { token: "${{ github.token }}", nightly-tag: "${{ inputs.roc-nightly || '' }}" }
+      - run: scripts/bundle.sh
+      - uses: actions/upload-artifact@v7
+        with: { name: bundle, path: dist, if-no-files-found: error }
+  test:
+    needs: bundle
+    runs-on: ${{ matrix.os }}
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-roc
+        with: { token: "${{ github.token }}", nightly-tag: "${{ inputs.roc-nightly || '' }}" }
+      - run: scripts/all_tests.sh
+      - uses: actions/download-artifact@v8
+        with: { name: bundle, path: dist }
+      - run: scripts/test_bundle.sh

@@ -7,15 +7,14 @@ import Ws
 ## messages, answers Ping and Close, fails the connection on a protocol error,
 ## and tracks the closing handshake.
 ##
-## A driver reads bytes, calls `receive`, writes each `Write` frame (masked
-## with `Protocol.masking` for a client), and acts on the other events. A
-## driver that reads at most `Protocol.wanted` bytes at a time never reads past
-## the current frame, so it can start a fresh `Protocol` between messages when
-## it has nowhere to keep the state.
+## A driver keeps the `Protocol` between reads: it reads any number of
+## bytes, calls `receive`, writes each `Write` frame (masked with
+## `Protocol.masking` for a client), and acts on the other events. Bytes after
+## the last whole frame stay in the state until more arrive.
 Protocol :: {
 	role : [Client, Server],
 	max_message : U64,
-	phase : [Open, Closing, Done],
+	phase : [Open, Closing({ code : U16, reason : Str }), Done(Ws.Closure)],
 	pending : List(U8),
 	partial : [Idle, Partial({ kind : [Text, Binary], bytes : List(U8) })],
 }.{
@@ -40,7 +39,24 @@ Protocol :: {
 
 	## Whether the connection has ended.
 	is_done : Protocol -> Bool
-	is_done = |p| p.phase == Done
+	is_done = |p| match p.phase {
+		Done(_) => Bool.True
+		_ => Bool.False
+	}
+
+	## How the connection ended, once it has.
+	closure : Protocol -> Try(Ws.Closure, [NotDone])
+	closure = |p| match p.phase {
+		Done(c) => Ok(c)
+		_ => Err(NotDone)
+	}
+
+	## The Close this endpoint sent and is waiting to see answered.
+	closing : Protocol -> Try({ code : U16, reason : Str }, [NotClosing])
+	closing = |p| match p.phase {
+		Closing(sent) => Ok(sent)
+		_ => Err(NotClosing)
+	}
 
 	## Whether no frame or message is half received.
 	is_idle : Protocol -> Bool
@@ -50,7 +66,7 @@ Protocol :: {
 	## this many never reads past the frame. 0 once the connection has ended.
 	wanted : Protocol -> U64
 	wanted = |p|
-		if p.phase == Done {
+		if Protocol.is_done(p) {
 			0
 		} else {
 			match Frame.header(p.pending, expected(p)) {
@@ -73,11 +89,11 @@ Protocol :: {
 	receive = |p, bytes| {
 		var $p = { ..p, pending: p.pending.concat(bytes) }
 		var $events = []
-		while $p.phase != Done {
+		while !Protocol.is_done($p) {
 			match Frame.header($p.pending, expected($p)) {
 				Err(Incomplete(_)) => break
 				Err(Invalid(why)) => {
-					(next, failed) = fail($p, CloseCode.protocol_error, why)
+					(next, failed) = fail_with($p, CloseCode.protocol_error, why)
 					$p = next
 					$events = $events.concat(failed)
 				}
@@ -88,7 +104,7 @@ Protocol :: {
 					}
 					data = !Frame.is_control(h.opcode)
 					if data and so_far + h.length > $p.max_message {
-						(next, failed) = fail($p, CloseCode.too_big, "a message of more than ${$p.max_message.to_str()} bytes")
+						(next, failed) = fail_with($p, CloseCode.too_big, "a message of more than ${$p.max_message.to_str()} bytes")
 						$p = next
 						$events = $events.concat(failed)
 					} else {
@@ -116,14 +132,43 @@ Protocol :: {
 			Err(NotOpen)
 		} else {
 			payload = CloseCode.payload(code, reason)?
-			Ok(({ ..p, phase: Closing }, close_frame(payload)))
+			Ok(({ ..p, phase: Closing({ code, reason }) }, close_frame(payload)))
 		}
+
+	## Fail the connection (RFC 6455 section 7.1.7): the Close with `code` to
+	## send (unless a Close was sent already) and the `Closed` event.
+	fail : Protocol, U16, Str -> (Protocol, List(Protocol.Event))
+	fail = |p, code, why| fail_with(p, code, why)
+
+	## The received bytes not yet consumed: the start of the next frame.
+	pending_bytes : Protocol -> List(U8)
+	pending_bytes = |p| p.pending
+
+	## The largest message accepted, in bytes.
+	max_message : Protocol -> U64
+	max_message = |p| p.max_message
+
+	## Add received bytes without processing them, for a driver that reads
+	## raw frames with `take_frame`.
+	push : Protocol, List(U8) -> Protocol
+	push = |p, bytes| { ..p, pending: p.pending.concat(bytes) }
+
+	## The next whole frame of the received bytes as it is: no assembly, no
+	## reply, no state change but removing its bytes.
+	take_frame : Protocol -> Try((Protocol, Frame), [Incomplete(U64), Invalid(Str)])
+	take_frame = |p| {
+		{ frame, rest } = Frame.decode(p.pending, expected(p))?
+		Ok(({ ..p, pending: rest }, frame))
+	}
 
 	## The transport ended with no Close frame (the peer closed the TCP
 	## connection, or a read failed for good): the connection is done, with
 	## code 1006.
 	ended : Protocol -> (Protocol, Ws.Closure)
-	ended = |p| ({ ..p, phase: Done }, Ws.dropped)
+	ended = |p| match p.phase {
+		Done(c) => (p, c)
+		_ => ({ ..p, phase: Done(Ws.dropped), pending: [], partial: Idle }, Ws.dropped)
+	}
 }
 
 expected : Protocol -> Frame.Expect
@@ -137,12 +182,12 @@ close_frame = |payload| { fin: Bool.True, opcode: Close, payload }
 
 ## Fail the connection (RFC 6455 section 7.1.7): send a Close with `code`
 ## unless one was sent already, and end.
-fail : Protocol, U16, Str -> (Protocol, List(Protocol.Event))
-fail = |p, code, why| {
+fail_with : Protocol, U16, Str -> (Protocol, List(Protocol.Event))
+fail_with = |p, code, why| {
 	reason = clip(why, 123)
 	closure = { code, reason, clean: Bool.False, by: Us }
 	writes =
-		if p.phase == Open {
+		if Protocol.is_open(p) {
 			match CloseCode.payload(code, reason) {
 				Ok(payload) => [Write(close_frame(payload))]
 				Err(_) => crash "Protocol.fail: an invalid close code"
@@ -150,7 +195,7 @@ fail = |p, code, why| {
 		} else {
 			[]
 		}
-	({ ..p, phase: Done, pending: [], partial: Idle }, writes.append(Closed(closure)))
+	({ ..p, phase: Done(closure), pending: [], partial: Idle }, writes.append(Closed(closure)))
 }
 
 ## At most `n` bytes of `text`, cut at a character boundary.
@@ -185,7 +230,7 @@ deliver = |p, kind, bytes| {
 		Text =>
 			match Str.from_utf8(bytes) {
 				Ok(s) => (idle, [Message(Text(s))])
-				Err(_) => fail(idle, CloseCode.invalid_payload, "a text message that is not UTF-8")
+				Err(_) => fail_with(idle, CloseCode.invalid_payload, "a text message that is not UTF-8")
 			}
 	}
 }
@@ -200,7 +245,7 @@ on_frame = |p, frame| {
 	match frame.opcode {
 		Text | Binary =>
 			match (p.partial, kind_of(frame.opcode)) {
-				(Partial(_), _) => fail(p, CloseCode.protocol_error, "a new message before the last one ended")
+				(Partial(_), _) => fail_with(p, CloseCode.protocol_error, "a new message before the last one ended")
 				(Idle, Ok(kind)) =>
 					if frame.fin {
 						deliver(p, kind, frame.payload)
@@ -211,7 +256,7 @@ on_frame = |p, frame| {
 			}
 		Continuation =>
 			match p.partial {
-				Idle => fail(p, CloseCode.protocol_error, "a continuation frame with no message")
+				Idle => fail_with(p, CloseCode.protocol_error, "a continuation frame with no message")
 				Partial({ kind, bytes }) => {
 					all = bytes.concat(frame.payload)
 					if frame.fin {
@@ -222,7 +267,7 @@ on_frame = |p, frame| {
 				}
 			}
 		Ping =>
-			if p.phase == Open {
+			if Protocol.is_open(p) {
 				(p, [Ping(frame.payload), Write(Frame.pong(frame.payload))])
 			} else {
 				(p, [Ping(frame.payload)])
@@ -230,14 +275,15 @@ on_frame = |p, frame| {
 		Pong => (p, [Pong(frame.payload)])
 		Close =>
 			match CloseCode.parse(frame.payload) {
-				Err(Invalid({ code, why })) => fail(p, code, why)
+				Err(Invalid({ code, why })) => fail_with(p, code, why)
 				Ok({ code, reason, has_code }) => {
-					done = { ..p, phase: Done, pending: [], partial: Idle }
-					if p.phase == Open {
+					if Protocol.is_open(p) {
 						echo = if (has_code) frame.payload.take_first(2) else []
-						(done, [Write(close_frame(echo)), Closed({ code, reason, clean: Bool.True, by: Peer })])
+						c = { code, reason, clean: Bool.True, by: Peer }
+						({ ..p, phase: Done(c), pending: [], partial: Idle }, [Write(close_frame(echo)), Closed(c)])
 					} else {
-						(done, [Closed({ code, reason, clean: Bool.True, by: Us })])
+						c = { code, reason, clean: Bool.True, by: Us }
+						({ ..p, phase: Done(c), pending: [], partial: Idle }, [Closed(c)])
 					}
 				}
 			}
@@ -339,3 +385,27 @@ expect {
 # A server accepts a masked fragmented binary message.
 expect events(server, masked({ fin: Bool.False, opcode: Binary, payload: [1] }).concat(masked({ fin: Bool.True, opcode: Continuation, payload: [2] }))) == [Message(Binary([1, 2]))]
 expect clip("héllo", 2) == "h"
+
+# Raw frames.
+expect
+	match client.push([0x89, 0x01, 0x21, 0x81]).take_frame() {
+		Ok((p, f)) =>
+			f
+				== Frame.ping([0x21])
+				and (
+					match p.take_frame() {
+						Err(Incomplete(2)) => Bool.True
+						_ => Bool.False
+					}
+				)
+		Err(_) => Bool.False
+	}
+expect {
+	(p, _) = client.receive(enc(close_frame([0x03, 0xE8])))
+	p.closure() == Ok({ code: 1000, reason: "", clean: Bool.True, by: Peer }) and p.ended().1 == (p.closure() ?? Ws.dropped)
+}
+expect
+	match client.close(4000, "x") {
+		Ok((p, _)) => p.closing() == Ok({ code: 4000, reason: "x" })
+		Err(_) => Bool.False
+	}
