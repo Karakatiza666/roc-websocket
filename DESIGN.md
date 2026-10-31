@@ -10,11 +10,11 @@ Citations are `file:line`. Paths are abbreviated:
 
 | Short | Full path / source |
 | --- | --- |
-| `surreal/` | `/home/george/dev/Karakatiza666/roc/examples/reifying/surreal/` |
+| `surreal/` | `examples/reifying/surreal/` on the `reify` branch of Karakatiza666/roc (not yet published) |
 | `cli/` | basic-cli 0.26.0 bundle, `~/.cache/roc/packages/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t/` |
 | `bws/` | basic-webserver tag 0.19.0 (commit `1654ae3f7f`), cloned read-only |
-| `talon/` | `/home/george/dev/Karakatiza666/talon/cloudflare-workers/` |
-| `Builtin.roc` | `/home/george/dev/Karakatiza666/roc/src/build/roc/Builtin.roc` |
+| `talon/` | `cloudflare-workers/` in roc-talon/talon |
+| `Builtin.roc` | `src/build/roc/Builtin.roc` in roc-lang/roc |
 
 "Inference" marks a claim that was not read in code or verified by a probe.
 
@@ -743,7 +743,7 @@ is two values of one Surreal Transport type, not modelled here).
 
 ## 9. Probes
 
-Checked with `/home/george/dev/Karakatiza666/roc/zig-out/bin/roc` (debug-befc71f7),
+Checked with a local debug build of the compiler (`reify` branch, befc71f7),
 `roc check`, 0 errors each (one warning: the `echo!` loop's unreachable `Ok({})`).
 
 | File | Proves |

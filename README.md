@@ -34,7 +34,7 @@ Add the package to the header with its release URL. The release notes of each
 ```roc
 app [...] {
 	pf: platform "...",
-	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.1/<hash>.tar.zst",
+	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.1/4i6sgv5VVbr9xet5sWkRWMYa4H3dMUJSzWrMhRXsFTgn.tar.zst",
 }
 
 import ws.Ws
