@@ -184,7 +184,7 @@ Client :: [].{
 	## adapter has already connected to its host and port (and done TLS for
 	## `wss://`). A refused upgrade, the stream ending during it, or no answer
 	## before the platform's read deadline is `Refused`.
-	open! : Client.Transport(b, e), b, Ws.Request => Try(Ws.Opened(Client.Conn(b, e)), Client.Error(e))
+	open! : Client.Transport(b, e), b, Ws.ConnectRequest => Try(Ws.Opened(Client.Conn(b, e)), Client.Error(e))
 	open! = |transport, link0, request| {
 		url = Handshake.parse_url(request.url).map_err(|BadUrl(why)| Refused(why))?
 		max_message = request.?max_message ?? Client.default_max_message

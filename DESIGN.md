@@ -26,7 +26,7 @@ Citations are `file:line`. Paths are abbreviated:
 
 | Module | Contents |
 | --- | --- |
-| `Ws` | `Error(e)`, `Message`, `Closure`, `Request`, `Opened(c)`, `AcceptOptions`; the feature aliases; the pre-composed aliases; `messages`, `close_and_wait!`, `drive!` (generic over any adapter's operations), `dropped` |
+| `Ws` | `Error(e)`, `Message`, `Closure`, `ConnectRequest`, `Opened(c)`, `AcceptOptions`; the feature aliases; the pre-composed aliases; `messages`, `close_and_wait!`, `drive!` (generic over any adapter's operations), `dropped` |
 | `Frame` | `Frame := { fin, opcode, payload }` (`is_eq` derived), `Opcode`, `Masking`, `Expect`, `Header`; `encode`, `header`, `decode`, `mask`, `fragments`, constructors |
 | `CloseCode` | named codes, `is_sendable` (1000-1003, 1007-1014, 3000-4999), `payload`, `parse` |
 | `Base64`, `Sha1` | encode/decode; SHA-1 (FIPS 180-4) |
@@ -141,7 +141,7 @@ application picks), `Poll` (a receive bounded by the platform's own read
 deadline, which is what basic-webserver can do exactly), `Buffered`,
 `AutoResponse` (a fixed text reply the runtime sends by itself), `Persist`
 (per-connection state that survives the server leaving memory), `Topics`
-(publish/subscribe groups), `Dial`, `Accept`, `Handlers`, and the inputs `Bytes`
+(publish/subscribe groups), `Connect` (`Dial` before 0.0.3), `Accept`, `Handlers`, and the inputs `Bytes`
 and `Random`. Generalized or dropped from 3.3: `Hibernation` became `Persist`
 without tags (connection tags are a Workers notion; the general grouping feature
 is `Topics`); `AutoResponse` lost `auto_response_ms!` (a Workers timestamp).
@@ -234,13 +234,17 @@ shared types asked for something a platform in general cannot give:
   `Client.read_size` is private.
 - Docs: the module doc of `Ws` named only `Closed` as shared; `AcceptOptions`
   did not document `max_message`; `Client.poll!` named a platform's deadline.
+- **`Dial` became `Connect`** (its field is `connect!`, as `Accept` has
+  `accept!`), and **`Ws.Request` became `Ws.ConnectRequest`**: `q` in `Accept`
+  is a request too, the server's.
+- **`Ws.messages` ends with the closure**: its last item is
+  `Err(Closed(closure))`, the error that ended it, as for any other error.
+  It used to end with no item, so the closure was lost.
 
 Considered and kept (each a design choice, listed in the 0.0.3 audit):
-`Errors`/`Error` (one letter apart, but now a stated convention), `Dial` with the
-field `connect!`, `Ws.Request` (a client's request, while `q` in `Accept` is the
-server's), `Basic` and `Push` (one-alias compositions), `Closing` in the rows of
+`Errors`/`Error` (one letter apart, but now a stated convention), `Basic` and `Push` (one-alias compositions), `Closing` in the rows of
 receiving fields (needed so generic code mixes fields with no widening, 0.4),
-`Ws.messages` dropping the closure, and the helpers taking open records
+`Handlers(s, c, e)` with the state first, and the helpers taking open records
 (`{ receive! : ..., .. }`, so an adapter's whole record passes as is).
 
 ---

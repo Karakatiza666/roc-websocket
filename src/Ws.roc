@@ -51,7 +51,7 @@ Ws :: [].{
 	## subprotocols offered in order (default none), `headers` extra request
 	## headers (default none), `max_message` the largest message accepted, in
 	## bytes; a bigger one fails the connection with 1009.
-	Request : { url : Str, protocols ?: List(Str), headers ?: List((Str, Str)), max_message ?: U64 }
+	ConnectRequest : { url : Str, protocols ?: List(Str), headers ?: List((Str, Str)), max_message ?: U64 }
 
 	## An open connection `conn`, with what the handshake settled: the chosen
 	## subprotocol (`""` for none) and the extensions, `Reported(list)` (an
@@ -124,7 +124,7 @@ Ws :: [].{
 
 	## Open a client connection `c`. A server that refuses the upgrade is
 	## `Refused(Str)` in `e`.
-	Dial(c, e, r) : { connect! : Ws.Request => Try(Ws.Opened(c), Ws.Error(e)), ..r }
+	Connect(c, e, r) : { connect! : Ws.ConnectRequest => Try(Ws.Opened(c), Ws.Error(e)), ..r }
 
 	## Accept an upgrade of an incoming request `q` into a server connection
 	## `c`. `response` is the handshake response `p` that the application
@@ -178,8 +178,9 @@ Ws :: [].{
 
 	# ------------------------------------------------------------ helpers
 
-	## The messages of a connection as a stream, until it closes. An error
-	## other than `Closed` is an `Err` item, after which the stream ends.
+	## The messages of a connection as a stream. The last item is the `Err`
+	## that ended it: `Err(Closed(closure))` once the connection has ended, or
+	## another error of `receive!`.
 	messages : { receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c -> Stream(Try(Ws.Message, Ws.Error(e)))
 	messages = |ops, conn| Stream.custom(
 		Going(conn),
@@ -188,8 +189,7 @@ Ws :: [].{
 			Going(c) =>
 				match (ops.receive!)(c) {
 					Ok((next, m)) => Ok((Ok(m), Going(next)))
-					Err(Closed(_)) => Err(NoMore)
-					Err(other) => Ok((Err(other), Stopped))
+					Err(err) => Ok((Err(err), Stopped))
 				}
 			Stopped => Err(NoMore)
 		},

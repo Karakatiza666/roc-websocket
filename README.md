@@ -34,7 +34,7 @@ Add the package to the header with its release URL. The release notes of each
 ```roc
 app [...] {
 	pf: platform "...",
-	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.3/FFY2gCnmKgndfxWwpBbtee1MYKR9K9YuzN9nEEPXG8B7.tar.zst",
+	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.3/FvsFHmH7m6LoMumXLxEHEfUoApGWdkgoFshfYEctaMNM.tar.zst",
 }
 
 import ws.Ws
@@ -70,7 +70,8 @@ A connection of an adapter usually has the operations as methods too:
 their way and ends with `Err(Closed({ by: Us, .. }))`; meanwhile `send!` gives
 `Err(Closing)`. `Ws.close_and_wait!(ops, conn, CloseCode.normal, "")` does both. `Ws.drive!(ops, conn, state, handlers)` runs push-style handlers
 over a pull connection, threading `state`. `Ws.messages(ops, conn)` is a `Stream`
-of the messages.
+of the messages whose last item is the error that ended it, `Err(Closed(closure))`
+at the end of the connection.
 
 ### Features
 
@@ -97,7 +98,7 @@ adds (`InvalidClose(Str)`, `ControlTooLong(U64)`, `BadFrame(Str)`,
 | `AutoResponse(c, e, r)` | a fixed text reply the runtime sends by itself; `c` is its scope (a connection or a whole server) |
 | `Persist(c, e, r)` | per-connection state that survives the server leaving memory |
 | `Topics(c, e, r)` | `subscribe!`, `unsubscribe!`, `publish!` |
-| `Dial(c, e, r)` | open a client connection: `Opened(c)`, whose `extensions` are `Reported(list)` or `NotReported` |
+| `Connect(c, e, r)` | `connect!(request)` opens a client connection: `Opened(c)`, whose `extensions` are `Reported(list)` or `NotReported` |
 | `Accept(q, p, c, e, r)` | accept an upgrade: `{ response : p, opened }`, `p` the 101 response a request handler returns to its runtime, or `{}` |
 | `Handlers(s, c, e)` | push-model callbacks with state `s` |
 | `Bytes(b, e, r)`, `Random(b, e, r)` | what the pure client needs from a platform |
@@ -145,8 +146,8 @@ ROC=/path/to/roc scripts/test_bundle.sh   # the examples and tests against the b
 124 `expect`s in `src/`: RFC 6455 vectors (the handshake key, the section 5.7
 frames, fragmentation, close codes), RFC 4648 Base64 vectors, SHA-1 vectors, and
 the protocol state machine. `tests/client.roc` runs the client over a scripted
-link (22 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
-handshake and `Closing`, generic code over a closed record, `drive!`,
+link (23 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
+handshake and `Closing`, generic code over a closed record, `messages`, `drive!`,
 `close_and_wait!`, refusals).
 
 ## Changes
@@ -165,6 +166,14 @@ API cleanup from an audit of the two adapters. Breaking, with the migration:
 - `Client.Conn(b, e)` is opaque: its fields cannot be read or built outside
   `Client`. `conn.link()` gives the link value (it was `conn.link`).
 - `Client.read_size` is no longer public.
+- `Ws.Dial(c, e, r)` is now `Ws.Connect(c, e, r)`, matching `Accept` and
+  `accept!`; the field is still `connect!`. Rename it in type annotations.
+- `Ws.Request` is now `Ws.ConnectRequest` (the `Accept` alias's `q` is the
+  server's incoming request). Rename it in type annotations.
+- `Ws.messages` no longer drops the closure: the stream's last item is
+  `Err(Closed(closure))` (any other error was already an `Err` item). Code that
+  treated every `Err` item as a failure should match `Err(Closed(_))` as the
+  normal end.
 
 Added: `Ws.Error(e)`, a name for `[Closed(Ws.Closure), Closing, ..e]`, used by
 every alias; `Client.Error(e)` is `Ws.Error(Client.Errors(e))`, the same type
