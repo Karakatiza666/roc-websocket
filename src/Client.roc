@@ -17,8 +17,8 @@ Client :: [].{
 	## The tags the client adds to the platform's row `e`.
 	Errors(e) : [Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
 
-	## Every error of a client call: `Closed` and `Client.Errors(e)`.
-	Error(e) : [Closed(Ws.Closure), Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
+	## Every error of a client call: `Closed`, `Closing` and `Client.Errors(e)`.
+	Error(e) : [Closed(Ws.Closure), Closing, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
 
 	## What `Client.open!` needs: a byte stream and randomness over one link
 	## value `b`, whose errors are the platform's row with the client's tags.
@@ -203,7 +203,7 @@ Client :: [].{
 		agreed = Handshake.check_response(response, client_request)?
 		start = Conn.{ ops: link_ops, link: link3, protocol: Protocol.new(Client, max_message), inbox: [] }
 		conn = apply_events!(start, start.protocol.receive(rest))?
-		Ok({ conn, protocol: agreed.protocol, extensions: agreed.extensions })
+		Ok({ conn, protocol: agreed.protocol, extensions: Reported(agreed.extensions) })
 	}
 }
 
@@ -260,7 +260,7 @@ usable = |conn| match conn.protocol.closure() {
 	Ok(closure) => Err(Closed(closure))
 	Err(NotDone) =>
 		match conn.protocol.closing() {
-			Ok({ code, reason }) => Err(Closed({ code, reason, clean: Bool.False, by: Us }))
+			Ok(_) => Err(Closing)
 			Err(NotClosing) => Ok({})
 		}
 }

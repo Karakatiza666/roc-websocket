@@ -56,6 +56,12 @@ open! = |chunks| match Client.open!(fake_ops, { chunks, written: [] }, { url: "w
 }
 
 ## The closure of a result that is `Closed`.
+is_closing : Try(x, Client.Error([])) -> Bool
+is_closing = |result| match result {
+	Err(Closing) => Bool.True
+	_ => Bool.False
+}
+
 closed_with : Try(x, Client.Error([])) -> Try(Ws.Closure, [NotClosed])
 closed_with = |result| match result {
 	Err(Closed(c)) => Ok(c)
@@ -107,7 +113,8 @@ main! = |_args| {
 	# close! returns at once; receive! delivers what is on its way, then the end.
 	c9 = open!([Data(response("")), Data(server(Frame.text("in flight")).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
 	c10 = ok(c9.close!(1000, "bye"))
-	check!("send! after close! is Closed", c10.send!(Text("x")).is_err())
+	check!("send! after close! is Closing", is_closing(c10.send!(Text("x"))))
+	check!("close! after close! is Closing", is_closing(c10.close!(1000, "again")))
 	(c11, m5) = ok(c10.receive!())
 	check!("a message after close!", m5 == Text("in flight"))
 	check!("the closing handshake ends by us", closed_with(c11.receive!()) == Ok({ code: 1000, reason: "", clean: Bool.True, by: Us }))
@@ -125,6 +132,12 @@ main! = |_args| {
 		_ => check!("the closure again", Bool.False)
 	}
 
+	# The handshake: the client offers no extension, so it reports none.
+	match Client.open!(fake_ops, { chunks: [Data(response(""))], written: [] }, { url: "ws://example.com/" }) {
+		Ok(opened) => check!("the extensions are reported, none", opened.extensions == Reported([]))
+		Err(_) => check!("the extensions are reported, none", Bool.False)
+	}
+
 	# Generic code over the ops record: close_and_wait! and drive!.
 	c13 = open!([Data(response("")), Data(server(Frame.text("a")).concat(server(Frame.text("b"))).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
 	ops = Client.ops({})
@@ -137,6 +150,9 @@ main! = |_args| {
 	check!("drive! threads the state", seen == [Text("a"), Text("b"), Text("closed 1000")])
 	c14 = open!([Data(response("")), Data(server(Frame.text("dropped")).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
 	check!("close_and_wait!", Ws.close_and_wait!(ops, c14, 1000, "") == Ok({ code: 1000, reason: "", clean: Bool.True, by: Us }))
+	c15 = open!([Data(response("")), Data(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] }))])
+	c16 = ok(c15.close!(4000, "first"))
+	check!("close_and_wait! of a closing connection waits for it", Ws.close_and_wait!(ops, c16, 1000, "") == Ok({ code: 1000, reason: "", clean: Bool.True, by: Us }))
 
 	# Refusals.
 	refused = Client.open!(fake_ops, { chunks: [Data("HTTP/1.1 403 Forbidden\r\n\r\n".to_utf8())], written: [] }, { url: "ws://example.com/" })

@@ -1,5 +1,5 @@
 app [event!] {
-	pf: platform "../../../talon/cloudflare-workers/platform/main.roc",
+	pf: platform "../../../cloudflare-workers-ws/platform/main.roc",
 	ws: "../pkg/main.roc",
 }
 
@@ -9,7 +9,7 @@ import pf.Response
 import pf.WebSocket
 import ws.Socket
 
-## The talon adapter: a `WebSocket` of the platform as a `Socket.Conn` of the package.
+## The cloudflare-workers adapter: a `WebSocket` of the platform as a `Socket.Conn` of the package.
 conn_of : WebSocket -> Socket.Conn
 conn_of = |sock| {
 	send!: |msg| {

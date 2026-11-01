@@ -1,8 +1,8 @@
 # roc-websocket: design and platform analysis
 
-Status: version 0.0.1 is implemented in `src/` (shared types, pure core, byte-level
-client) with a basic-webserver adapter in the sibling repo
-`roc-basic-webserver-websocket`. Section 0 lists what the implementation settled or
+Status: version 0.0.2 is implemented in `src/` (shared types, pure core, byte-level
+client) with adapters in the sibling repos `roc-basic-webserver-websocket` and
+`roc-cloudflare-workers-websocket`. Section 0 lists what the implementation settled or
 changed; where it disagrees with a later section, section 0 wins. The rest is the
 original analysis, kept for its platform findings and citations.
 
@@ -13,14 +13,14 @@ Citations are `file:line`. Paths are abbreviated:
 | `surreal/` | `examples/reifying/surreal/` on the `reify` branch of Karakatiza666/roc (not yet published) |
 | `cli/` | basic-cli 0.26.0 bundle, `~/.cache/roc/packages/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t/` |
 | `bws/` | basic-webserver tag 0.19.0 (commit `1654ae3f7f`), cloned read-only |
-| `talon/` | `cloudflare-workers/` in roc-talon/talon |
+| `cfw/` | the `cloudflare-workers` platform ([roc-cloudflare-workers](https://github.com/Karakatiza666/roc-cloudflare-workers)) |
 | `Builtin.roc` | `src/build/roc/Builtin.roc` in roc-lang/roc |
 
 "Inference" marks a claim that was not read in code or verified by a probe.
 
 ---
 
-## 0. Implementation (version 0.0.1): settled and changed decisions
+## 0. Implementation (versions 0.0.1 and 0.0.2): settled and changed decisions
 
 ### 0.1 Modules
 
@@ -44,9 +44,9 @@ result, so the protocol state carries from call to call:
 
 ```roc
 Core(c, e, r) : {
-	send! : c, Ws.Message => Try(c, [Closed(Ws.Closure), ..e]),
-	receive! : c => Try((c, Ws.Message), [Closed(Ws.Closure), ..e]),
-	close! : c, U16, Str => Try(c, [Closed(Ws.Closure), ..e]),
+	send! : c, Ws.Message => Try(c, [Closed(Ws.Closure), Closing, ..e]),
+	receive! : c => Try((c, Ws.Message), [Closed(Ws.Closure), Closing, ..e]),
+	close! : c, U16, Str => Try(c, [Closed(Ws.Closure), Closing, ..e]),
 	..r
 }
 ```
@@ -89,7 +89,8 @@ Version 0.1 had no state between calls, which forced two things. Both are gone:
 1. **`close!` starts the close; `receive!` finishes it.** `close!` sends Close
    and returns the connection. `receive!` then delivers the messages already on
    their way and ends with `Closed({ by: Us, clean: True, .. })` when the peer's
-   Close arrives. `send!` after `close!` is `Closed` with the code sent. The
+   Close arrives. `send!` after `close!` is `Closing` (0.0.1 gave `Closed` with
+   the code sent and `clean: False`, a closure made up before the end; 0.10). The
    blocking form is the generic helper `Ws.close_and_wait!`, which works with any
    adapter. Once a connection has ended, every call on it returns the same
    `Closed` closure (0.1 gave 1006 after the first).
@@ -103,7 +104,7 @@ Version 0.1 had no state between calls, which forced two things. Both are gone:
 
 ### 0.4 Errors: one row shape everywhere (changes 3.2, 3.3, 3.6)
 
-Every effectful field of every alias returns `[Closed(Ws.Closure), ..e]`, with
+Every effectful field of every alias returns `[Closed(Ws.Closure), Closing, ..e]`, with
 the same `e` in every field of an adapter, including the inputs `Bytes` and
 `Random`. Fields with their own fixed tags do not work in code generic in `e`,
 verified with this compiler:
@@ -122,8 +123,8 @@ So a failure a feature adds is a tag of `e` by documented convention:
 `Client.Errors(e) = [Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]`
 and requires the link's row to be `Client.Errors(e)`, so link errors flow into
 connection errors with no mapping. A platform adds only its own tags
-(basic-webserver: `[Tcp(Str), Connect(Str), Entropy(Str)]`). `Closed` is the one
-shared tag (Q6 settled). Outcomes that are not failures are in the `Ok` side:
+(basic-webserver: `[Tcp(Str), Connect(Str), Entropy(Str)]`). `Closed` and
+`Closing` are the shared tags (Q6 settled; `Closing` since 0.0.2, 0.10). Outcomes that are not failures are in the `Ok` side:
 `ReceiveWithin` gives `TimedOut`, `Poll` gives `Idle`, `Persist.saved!` gives
 `Nothing`.
 
@@ -140,7 +141,8 @@ and `Random`. Generalized or dropped from 3.3: `Hibernation` became `Persist`
 without tags (connection tags are a Workers notion; the general grouping feature
 is `Topics`); `AutoResponse` lost `auto_response_ms!` (a Workers timestamp).
 WebSocketPair and Durable Object specifics stay in the Cloudflare adapter.
-Negotiated values stay values: `Opened(c) = { conn, protocol, extensions }`.
+Negotiated values stay values: `Opened(c) = { conn, protocol, extensions }`, with
+`extensions : [Reported(List(Str)), NotReported]` since 0.0.2 (0.10).
 
 Pre-composed aliases: `Basic(c, e)`, `Raw(c, e)` (core, ping, pong, frames),
 `Timed(c, e)`, `Push(c, e)`, `Transport(b, e)`; the client adds `Client.Ops(b, e)`
@@ -149,8 +151,8 @@ Pre-composed aliases: `Basic(c, e)`, `Raw(c, e)` (core, ping, pong, frames),
 ### 0.6 Adapters are packages (Q1 settled)
 
 An adapter is a separate package that depends on its platform and on
-roc-websocket (`roc-basic-webserver-websocket`; a Cloudflare one later, which uses
-no pure core). A package that names a platform works when the app names the
+roc-websocket (`roc-basic-webserver-websocket`, `roc-cloudflare-workers-websocket`,
+which uses no pure core). A package that names a platform works when the app names the
 identical platform URL. `roc bundle` refuses an adapter while it depends on
 roc-websocket by path, so roc-websocket is released first.
 
@@ -163,11 +165,11 @@ random effect; its adapter reads `/dev/urandom` with
 line), drops the newline, hashes at least 48 bytes (each uniform over 255 values,
 over 383 bits) with `Crypto.SHA256` and uses the 32-byte digest. Unix only.
 
-### 0.8 Not done in 0.0.1
+### 0.8 Not done yet
 
 A server driver (`accept!` over bytes for basic-cli; the pure parts,
 `Handshake.parse_upgrade`, `accept_response` and `Protocol` in the `Server` role,
-are done and tested), a basic-cli adapter, the Cloudflare adapter, `wss://`, and
+are done and tested), a basic-cli adapter, `wss://` in the pure client, and
 sending a message in fragments by size (the caller uses `Frame.fragments` with
 `send_frame!`).
 
@@ -182,6 +184,33 @@ sending a message in fragments by size (the caller uses `Frame.fragments` with
   standalone copy did not reproduce; the full repro is kept outside the repo.
 - `roc fmt` joins a multi-line record alias that has an extension row (`..r`)
   onto one line, so the feature aliases are long lines.
+
+### 0.10 Changes in 0.0.2, from the Cloudflare Workers adapter
+
+The adapter for the cloudflare-workers platform found three places where the
+shared types asked for something a platform in general cannot give:
+
+- **`Closing`.** A send on a connection that is closing or closed had to give
+  `Closed(Ws.Closure)`. A push-model server learns the closure only in its
+  close callback (a Durable Object's `webSocketClose`; the same for Bun, Deno,
+  browsers), and during the closing handshake no endpoint knows the final
+  closure yet; the 0.0.1 client made one up (`clean: False`). Now every row is
+  `[Closed(Ws.Closure), Closing, ..e]`: `Closing` from a field that sends when
+  the closure is not known to it, `Closed` once it is. One row for every field,
+  receiving ones included (they never give `Closing`), so generic code mixes
+  fields with no widening (0.4). `Ws.close_and_wait!` waits for a connection
+  that is closing already.
+- **`Opened.extensions : [Reported(List(Str)), NotReported]`.** A runtime that
+  negotiates and applies an extension itself may not tell the application
+  (workerd negotiates `permessage-deflate` while the socket's `extensions` is
+  `""`). The client gives `Reported([])`: it offers none.
+- **`Accept(q, p, c, e, r)`** gives `{ response : p, opened : Ws.Opened(c) }`.
+  On a platform whose request handler returns the 101 response (Workers,
+  Deno's `upgradeWebSocket`), the application returns `response` to its
+  runtime and uses the connection in work that runs after; a server that
+  writes the response itself uses `p = {}`.
+- **`AutoResponse` scope**, documented: `c` is the scope the runtime sets the
+  reply for, a connection or a whole server.
 
 ---
 
@@ -198,15 +227,15 @@ code and a reason, learn how it closed". They differ on three other axes:
 1. **Who owns the protocol.** On basic-cli and basic-webserver Roc owns the wire
    (Tcp bytes), so Roc can do anything RFC 6455 allows: raw frames, ping/pong,
    fragmentation, custom close handshake. On Cloudflare the runtime owns the wire;
-   Roc sees whole messages only (`talon/platform/WebSocket.roc:19`,
-   `talon/js/helpers.js:151-156`) and the runtime answers pings itself.
-2. **Who drives the loop.** basic-cli is pull (blocking reads). Talon is *also*
+   Roc sees whole messages only (`cfw/platform/WebSocket.roc:19`,
+   `cfw/js/helpers.js:151-156`) and the runtime answers pings itself.
+2. **Who drives the loop.** basic-cli is pull (blocking reads). Cloudflare Workers is *also*
    pull for a Worker-accepted socket and for a client socket (`receive!`,
-   `talon/platform/WebSocket.roc:103`), and push only for a Durable Object with
-   hibernation (`web_socket_message!` handler, `talon/platform/Object.roc:412`).
+   `cfw/platform/WebSocket.roc:103`), and push only for a Durable Object with
+   hibernation (`web_socket_message!` handler, `cfw/platform/Object.roc:412`).
    basic-webserver can only pull, and only as a client.
 3. **Server role at all.** basic-cli: possible (Tcp.listen!/accept!,
-   `cli/Tcp.roc:95,120`), single-threaded. Talon: yes, two forms. basic-webserver:
+   `cli/Tcp.roc:95,120`), single-threaded. Cloudflare Workers: yes, two forms. basic-webserver:
    no, by design and by code (section 6.2).
 
 So Cloudflare is not the lowest common denominator in a harmful sense: its
@@ -220,7 +249,7 @@ plain record fields typed by extensible aliases from the shared package (3.3).
 Pull vs push: **pull for connections, push for servers**, with a pure adapter
 from pull to push so one handler record runs everywhere (section 3.4). Push
 cannot be turned into pull on a hibernating Durable Object (there is no
-`receive!` and no Roc state across events, `talon/platform/Object.roc:146-147`),
+`receive!` and no Roc state across events, `cfw/platform/Object.roc:146-147`),
 so push is the only portable *server* shape; pull is the natural *client* shape
 on all three.
 
@@ -242,8 +271,8 @@ on all three.
  adapters (thin, app-side or platform-side; a package cannot import a platform)
    +-- basic-cli:        Tcp.Connection + Random  -> ByteLink -> Conn
    +-- basic-webserver:  Tcp.Connection + entropy -> ByteLink -> Conn   (client only)
-   +-- talon Worker:     pf.WebSocket            -> Conn                (no pure core)
-   +-- talon DO:         Object.Socket events    -> Sender + Handlers    (no pure core)
+   +-- cfw Worker:       pf.WebSocket            -> Conn                (no pure core)
+   +-- cfw DO:           Object.Socket events    -> Sender + Handlers    (no pure core)
 ```
 
 Why adapters live outside the package: a Roc package cannot import a platform's
@@ -252,14 +281,14 @@ were checked:
 
 - **A record of functions** (`ByteLink`, `Conn`), as `Surreal.Transport` does
   today (`surreal/Surreal.roc:2460-2465`, built in `surreal/watch.roc:235-241`).
-  Works on every platform. Probes `cli.roc`, `bws/app.roc`, `talon/app.roc`.
+  Works on every platform. Probes `cli.roc`, `bws/app.roc`, `cloudflare-workers/app.roc`.
 - **A `where` clause on effectful methods**: `of : c -> Link where
   [c.write_bytes! : c, List(U8) => Try({}, ew), c.read_exactly! : c, U64 =>
   Try(List(U8), er)]` accepts basic-cli's `Tcp.Connection` directly (probe
   `where_clause.roc`, type-checks and runs). It does not generalise: basic-webserver
-  names the write `write!` (`bws/platform/Tcp.roc:60`), and talon's message type
+  names the write `write!` (`bws/platform/Tcp.roc:60`), and the platform's message type
   is a nominal `WebSocket.Message := [Text(Str), Bytes(List(U8))]`
-  (`talon/platform/WebSocket.roc:19`) that the package cannot construct.
+  (`cfw/platform/WebSocket.roc:19`) that the package cannot construct.
   Also, a `where` clause cannot ask for `to_inspect` on a structural error union
   (probe finding: "does not have a method named to_inspect" for
   `[Interrupted, TcpErr(IOErr)]`). So the record is the primary mechanism; the
@@ -267,10 +296,10 @@ were checked:
 
 Recommendation: ship the adapters as source files in this repo under
 `adapters/<platform>/` that an app copies or imports as a local module, and
-(talon only, since it is the user's platform) optionally have talon itself
+(cloudflare-workers only, since it is the user's platform) optionally have cloudflare-workers itself
 depend on roc-websocket and expose `WebSocket.conn` / `Object.Socket.peer`
-(talon's platform header already takes package dependencies,
-`talon/platform/main.roc:7-10`). Open question Q1.
+(the platform's header already takes package dependencies,
+`cfw/platform/main.roc:7-10`). Open question Q1.
 
 ---
 
@@ -291,8 +320,8 @@ Closure : { code : U16, reason : Str, clean : Bool, by : [Peer, Us, Transport] }
 Err : [Closed(Closure), Failed(Str), TooLarge(U64), Protocol(Str)]
 ```
 
-`by` is new relative to talon's `Closed : { code, reason, clean }`
-(`talon/platform/WebSocket.roc:30`); talon can fill it from whether `close!` was
+`by` is new relative to the platform's `Closed : { code, reason, clean }`
+(`cfw/platform/WebSocket.roc:30`); cloudflare-workers can fill it from whether `close!` was
 called first (inference: the JS `close` event does not say who started it).
 
 ### 3.2 The adapter value and its shared core
@@ -336,15 +365,15 @@ Ping(e, r) : { ping! : List(U8) => Try({}, [Closed(Closure), ..e]), ..r }
 Frames(e, r) : { send_frame! : Frame => Try({}, [Closed(Closure), ..e]), receive_frame! : {} => Try(Frame, [Closed(Closure), ..e]), ..r }
 
 ## A receive that gives up after a deadline without losing a message.
-## basic-cli: Connection.with_timeout (cli/Tcp.roc:157-170). talon: Io.timeout.
+## basic-cli: Connection.with_timeout (cli/Tcp.roc:157-170). cloudflare-workers: Io.timeout.
 ReceiveWithin(e, r) : { receive_within! : U64 => Try(Message, [TimedOut, Closed(Closure), ..e]), ..r }
 
 ## A text request the platform answers with no wake (Cloudflare DO only,
-## talon/platform/Object.roc:386). App-level ping, not protocol ping.
+## cfw/platform/Object.roc:386). App-level ping, not protocol ping.
 AutoResponse(e, r) : { set_auto_response! : { request : Str, response : Str } => Try({}, [TooLarge, ..e]), clear_auto_response! : {} => {}, auto_response_ms! : {} => Try(U64, [NotFound]), ..r }
 
 ## Survives the server leaving memory (Cloudflare DO only): tags and a bytes
-## attachment (talon/platform/Object.roc:169, 549).
+## attachment (cfw/platform/Object.roc:169, 549).
 Hibernation(e, r) : { tags! : {} => List(Str), attachment! : {} => Try(List(U8), [NotFound]), set_attachment! : List(U8) => Try({}, [TooLarge, ..e]), ..r }
 ```
 
@@ -359,7 +388,7 @@ do_peer : Sender([Failed(Str)], AutoResponse([], Hibernation([], {})))
 Platform-specific extras are ordinary extra fields next to the shared ones,
 reusing a shared alias when another platform has the same feature (the
 Durable Object's `AutoResponse`, `Hibernation`) and a plain inline field when
-nobody else does (for example a talon-only `broadcast!`). Promote an extra to a
+nobody else does (for example a Workers-only `broadcast!`). Promote an extra to a
 shared alias the day a second platform gains it; consumers that picked the
 field by name keep working.
 
@@ -384,7 +413,7 @@ by a text message; that is `AutoResponse`, a different feature).
 connection is up or the request arrives stay values and `Try` results: the
 negotiated subprotocol and extensions (a return value of the connect/accept
 call, `{ conn, protocol }`), a server refusing the upgrade (`Err(Refused(..))`
-from `client!`), and whether talon is in a Durable Object or a plain Worker
+from `client!`), and whether cloudflare-workers is in a Durable Object or a plain Worker
 (which adapter constructor the app calls; the DO adapter is the one that yields
 a `Sender`, so the distinction is already in the type of the value, not a flag).
 Backpressure is no longer modelled: none of the three platforms exposes a
@@ -404,11 +433,11 @@ Handlers(p, e) : {
 drive! : Core(x, {}), Handlers(Core(x, {}), e) => Try({}, [Handler(e), Closed(Closure), ..x])
 ```
 
-- talon DO: the app's `web_socket_message!`/`web_socket_close!` call
+- cfw DO:   the app's `web_socket_message!`/`web_socket_close!` call
   `on_message!`/`on_close!` with the per-event `Sender` record (an adapter, 7.3). Roc keeps no
-  state across events (`talon/MODULES.md` 12.1 "Hibernation"), so per-socket state
+  state across events (`cfw/MODULES.md` 12.1 "Hibernation"), so per-socket state
   goes through the `Hibernation` fields or object storage, not a closure.
-- talon Worker accept, basic-cli server: `drive!` over a `Core` record.
+- Workers Worker accept, basic-cli server: `drive!` over a `Core` record.
 - basic-cli multi-client server: a round-robin `serve!` that polls each
   connection with a short `with_timeout` read (a timed-out read "consumes
   nothing", `cli/Tcp.roc` Connection docs, line 142). Latency grows with
@@ -462,7 +491,7 @@ forwards the whole adapter further.
 `read_exactly!` that times out midway (`bws/src/tcp.rs:400-420`: the partial
 `buffer` is local), so the core must keep its own buffer. Cloudflare needs none
 of this: `WebSocket.connect_with!` and `accept!` already exist
-(`talon/platform/WebSocket.roc:42,64`).
+(`cfw/platform/WebSocket.roc:42,64`).
 
 ### 3.6 Errors and open tag unions
 
@@ -556,7 +585,7 @@ offer them.
 
 ## 5. Per-platform mapping
 
-| | basic-cli 0.26.0 | basic-webserver 0.19.0 | talon Worker / client | talon Durable Object |
+| | basic-cli 0.26.0 | basic-webserver 0.19.0 | Workers Worker / client | Workers Durable Object |
 | --- | --- | --- | --- | --- |
 | Client | Yes, today (Surreal) | Yes, over Tcp, with limits | Yes, `WebSocket.connect_with!` | Yes, but a client socket does not hibernate (MODULES.md 12.2) |
 | Server | Possible: `Tcp.listen!`/`accept!` + pure handshake + Sha1 | **No** | Yes, `WebSocket.accept!` + `response.after` | Yes, `self.accept!`, hibernation |
@@ -565,10 +594,10 @@ offer them.
 | Needs pure core | Yes | Yes | No | No |
 | Randomness | `Random.seed_u64!` (`cli/Random.roc:8`) | **None** (no random effect in the hosted list, `bws/platform/Host.roc:115-189`) | `WebCrypto.random!` (not needed) | not needed |
 | Adapter type (4 rows: fields present) | `Core(e, Ping(e, ReceiveWithin(e, {})))`, `Frames` optional | `Core(e, Ping(e, {}))` (no `receive_within!`: fixed 30 s host timeout, `bws/src/tcp.rs:22`, so only with a Roc-side buffer, 6.2); `Frames` optional | `Core(e, ReceiveWithin(e, {}))` (`Io.timeout`); no `ping!`, no frames (runtime) | `Sender(e, AutoResponse(.., Hibernation(.., {})))`; no `receive!`, no `ping!` |
-| Extras beside shared fields | none | none | talon-only extras as inline fields | `broadcast!`, `sockets!` inline |
-| Outbound buffering | Blocking writes | Blocking writes (30 s) | Unbounded (`send` returns at once; inbound queue unbounded, `talon/js/helpers.js:151-156`) | Unbounded |
-| Size limit | none in platform | 8 MiB per read (`bws/src/tcp.rs:23`) | Cloudflare limit (inference: 32 MiB per message per current Cloudflare docs; not in talon code) | same |
-| Concurrent use | one thread; shared buffer | `StreamBusy` on concurrent use (`bws/src/tcp.rs:221-222`, `bws/platform/Tcp.roc:12-15`) | one task (ref, MC13) | one event (`talon/platform/Object.roc:146-147`) |
+| Extras beside shared fields | none | none | Workers-only extras as inline fields | `broadcast!`, `sockets!` inline |
+| Outbound buffering | Blocking writes | Blocking writes (30 s) | Unbounded (`send` returns at once; inbound queue unbounded, `cfw/js/helpers.js:151-156`) | Unbounded |
+| Size limit | none in platform | 8 MiB per read (`bws/src/tcp.rs:23`) | Cloudflare limit (inference: 32 MiB per message per current Cloudflare docs; not in cloudflare-workers code) | same |
+| Concurrent use | one thread; shared buffer | `StreamBusy` on concurrent use (`bws/src/tcp.rs:221-222`, `bws/platform/Tcp.roc:12-15`) | one task (ref, MC13) | one event (`cfw/platform/Object.roc:146-147`) |
 
 ---
 
@@ -639,42 +668,42 @@ under `bws/design.md:886-890`:
    "constrained host-owned messaging facility" the design asks to justify.
 3. TLS on Tcp for `wss://` clients.
 
-### 6.3 talon/cloudflare-workers (the user's platform)
+### 6.3 cloudflare-workers (the user's platform)
 
 Already built (more than the earlier read suggested):
 - `WebSocket` module: `accept!` (WebSocketPair + accept + 101,
-  `talon/platform/WebSocket.roc:42`), `connect`/`connect_with` with headers and
+  `cfw/platform/WebSocket.roc:42`), `connect`/`connect_with` with headers and
   `protocols` (`:64`), `send!` (`:90`), `receive`/`receive!` with no deadline and
-  race-safe (`:103`, `talon/js/helpers.js:382-408`), `close!` (`:119`),
+  race-safe (`:103`, `cfw/js/helpers.js:382-408`), `close!` (`:119`),
   `Message := [Text(Str), Bytes(List(U8))]` with `json` (`:19`), `Closed`
   (`:30`), `ws://`→`http://` rewrite (`:132`).
-- JS glue: `wsPair`, `wsAccept`, `wsReceive` (`talon/js/helpers.js:365,373,382`),
+- JS glue: `wsPair`, `wsAccept`, `wsReceive` (`cfw/js/helpers.js:365,373,382`),
   a per-socket queue and waiter list (`:136-160`), `binaryType = 'arraybuffer'`
   (`:143`).
 - Durable Object hibernation: `self.accept!`/`accept_with!` tags
-  (`talon/platform/Object.roc:330,338`, `:730-745`), `sockets!`/`sockets_with!`
+  (`cfw/platform/Object.roc:330,338`, `:730-745`), `sockets!`/`sockets_with!`
   (`:342,346`), `broadcast!`/`broadcast_with!` (`:351-373`),
   `set_auto_response!`/`clear_auto_response!`/`auto_response_ms!`
   (`:386,393,182`), `Socket.tags!` (`:169`), typed CBOR `Attachment` (`:549`),
   handlers `web_socket_message!`/`close!`/`error!` (`:412-414`).
 - Edge-verified: a Worker socket stays open with no traffic for 40 s, a
   hibernating object leaves memory after 90 s and its attachment reads back,
-  `wss://` client works (`talon/MODULES.md` 12.4 last paragraph).
+  `wss://` client works (`cfw/MODULES.md` 12.4 last paragraph).
 
-The talon adapter to the proposed `Conn` type-checks today with no platform
-change (probe `talon/app.roc`). So the core needs nothing new from talon. What
+The cloudflare-workers adapter to the proposed `Conn` type-checks today with no platform
+change (probe `cloudflare-workers/app.roc`). So the core needs nothing new from cloudflare-workers. What
 would make the adapter complete:
 
 | Gap | Where | Smallest change |
 | --- | --- | --- |
-| Negotiated subprotocol of a client is not exposed | `wsAccept` returns only `ws` (`talon/js/helpers.js:373-377`) | `wsAccept` returns `[ws, ws.protocol ?? '']`; `connect_with` gives `{ socket, protocol }`, or a `WebSocket.protocol!` that reads `ws.protocol` with one `Get` op |
-| Server cannot see which subprotocols the client offered, except by reading the request header | `accept!` takes no options (`WebSocket.roc:42`) | `accept_with!(req, { protocol ?: Str })` that sets `Sec-WebSocket-Protocol` on the 101 (`Response.with_header` exists, `talon/platform/Response.roc:68`; inference that workerd forwards it) |
-| `send!` collapses every throw into `Closed` | `talon/platform/Remote.roc:46-50` | keep `Closed` for "after close()", map other throws (size) to `TooLarge`/`Failed` |
-| `close!` drops errors | `talon/platform/Remote.roc:53-57`; reason documented at MODULES.md 12.4 | fine for the core (`close!` returning `Ok` always), but report an invalid code as `Err(BadCode)` instead of dropping it |
-| Inbound queue is unbounded | `st.queue.push(v)` (`talon/js/helpers.js:155`) | a `max_queued` option; above it, `ws.close(1008)` (inference: Workers has no read-side flow control, so closing is the only defence) |
+| Negotiated subprotocol of a client is not exposed | `wsAccept` returns only `ws` (`cfw/js/helpers.js:373-377`) | `wsAccept` returns `[ws, ws.protocol ?? '']`; `connect_with` gives `{ socket, protocol }`, or a `WebSocket.protocol!` that reads `ws.protocol` with one `Get` op |
+| Server cannot see which subprotocols the client offered, except by reading the request header | `accept!` takes no options (`WebSocket.roc:42`) | `accept_with!(req, { protocol ?: Str })` that sets `Sec-WebSocket-Protocol` on the 101 (`Response.with_header` exists, `cfw/platform/Response.roc:68`; inference that workerd forwards it) |
+| `send!` collapses every throw into `Closed` | `cfw/platform/Remote.roc:46-50` | keep `Closed` for "after close()", map other throws (size) to `TooLarge`/`Failed` |
+| `close!` drops errors | `cfw/platform/Remote.roc:53-57`; reason documented at MODULES.md 12.4 | fine for the core (`close!` returning `Ok` always), but report an invalid code as `Err(BadCode)` instead of dropping it |
+| Inbound queue is unbounded | `st.queue.push(v)` (`cfw/js/helpers.js:155`) | a `max_queued` option; above it, `ws.close(1008)` (inference: Workers has no read-side flow control, so closing is the only defence) |
 | No outbound buffer view | — | none possible (inference: workerd's WebSocket has no `bufferedAmount`); `backpressure: Unbounded` |
 | `Closed` has no "who closed" | `closed_of` (`WebSocket.roc:143-158`) | record `closeCalled` in `acceptSocket` state, add `by` |
-| DO socket is good for one event only | `talon/platform/Object.roc:146-147` | none needed; `Handlers` gets a fresh `Sender` per event |
+| DO socket is good for one event only | `cfw/platform/Object.roc:146-147` | none needed; `Handlers` gets a fresh `Sender` per event |
 | Hibernatable event timeout, `serializeAttachment` of bytes | — | optional: `Object.Socket.attachment_bytes!` so the package's untyped `hibernation` feature needs no CBOR type at the adapter |
 
 Not possible on Cloudflare, by the runtime: raw frames, protocol ping/pong,
@@ -696,9 +725,9 @@ Same `ByteLink`, with `write!` instead of `write_bytes!`, `read_up_to!` with a
 Roc-side buffer, and entropy from a future `Random` (6.2). Probe `bws/app.roc`
 relays a WebSocket upstream to an SSE response.
 
-### 7.3 talon
+### 7.3 cloudflare-workers
 A `Core` record from `WebSocket`: map `Text`/`Bytes` to `Text`/`Binary`,
-`Closed(c)` to `Closed(c)` (probe `talon/app.roc`, an echo Worker with
+`Closed(c)` to `Closed(c)` (probe `cloudflare-workers/app.roc`, an echo Worker with
 `response.after`). A `Sender` record from `Object.Socket` per event, with the
 `Hibernation` and `AutoResponse` fields present.
 
@@ -714,8 +743,8 @@ is two values of one Surreal Transport type, not modelled here).
 
 - **Q1. Where do adapters live?** (a) copy-in source files under
   `adapters/` of this repo, (b) separate tiny packages per platform that take
-  the platform functions as a record, (c) for talon, inside the platform
-  (talon depends on roc-websocket). (c) couples talon releases to this package.
+  the platform functions as a record, (c) for cloudflare-workers, inside the platform
+  (cloudflare-workers depends on roc-websocket). (c) couples cloudflare-workers releases to this package.
 - **Q2. basic-webserver server support.** It needs an upstream platform
   change that its design currently rules out (`bws/design.md:877-890`). Pursue
   the SSE-style host-parked proposal (6.2 item 2) with the maintainers, or
@@ -727,7 +756,7 @@ is two values of one Surreal Transport type, not modelled here).
 - **Q4. Randomness.** Per-frame platform randomness (simple) or one seed per
   connection expanded with builtin BLAKE3 (fewer effects, needs a review of the
   construction)? basic-webserver has no entropy source either way.
-- **Q5. Scope of the first version.** Suggested order: message core + talon
+- **Q5. Scope of the first version.** Suggested order: message core + cloudflare-workers
   adapter (no pure core needed) and basic-cli client (pure core extracted from
   `surreal/Ws.roc`); then `Sha1` + server handshake for basic-cli; then the
   basic-webserver client; basic-webserver server only if Q2 goes ahead.
@@ -757,7 +786,7 @@ Checked with a local debug build of the compiler (`reify` branch, befc71f7),
 | `probes/pkg/Ws.roc` | copy of `surreal/Ws.roc`, the pure core it reuses |
 | `probes/where_clause.roc` + `probes/pkg/Conn.roc` | a package `where` clause on effectful methods accepts basic-cli `Tcp.Connection`; also ran (exit 1, connection refused, as expected) |
 | `probes/cli.roc` | basic-cli `Conn` over the pure core with `features.ping` Supported |
-| `probes/talon/app.roc` | talon `WebSocket` adapted to `Conn`, echo Worker; platform path is relative to this repo's sibling `talon/` |
+| `probes/cloudflare-workers/app.roc` | the platform's `WebSocket` adapted to `Conn`, echo Worker; the platform path is a sibling checkout of the cloudflare-workers platform |
 | `probes/bws/app.roc` | basic-webserver WebSocket client relayed as SSE. Platform path expects a 0.19.0 checkout at `../../basic-webserver-0.19.0`; it was checked against a clone elsewhere |
 
 No probe opened a real WebSocket: no local echo server was available (Python
