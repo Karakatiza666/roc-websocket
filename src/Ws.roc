@@ -15,18 +15,27 @@ import Frame
 ## alias `c` is the connection, `e` the platform's extra error tags, and `r`
 ## the rest of the record.
 ##
-## The error rule: every effectful field returns `[Closed(Ws.Closure), Closing, ..e]`,
-## with one `e` for all the fields of an adapter. `Closed` is the one tag every
-## adapter shares. A failure that a feature adds is a tag of `e`, because code
-## generic in a row variable cannot widen it. Tags of `e` with a shared meaning:
+## The error rule: every effectful field returns `Ws.Error(e)`, that is
+## `[Closed(Ws.Closure), Closing, ..e]`, with one `e` for all the fields of an
+## adapter. `Closed` and `Closing` are the tags every adapter shares. A failure
+## that a feature adds is a tag of `e`, because code generic in a row variable
+## cannot widen it. Tags of `e` with a shared meaning:
 ## - `InvalidClose(Str)`: `close!` got a code that may not be sent or a reason
 ##   over 123 bytes.
 ## - `ControlTooLong(U64)`: a Ping or Pong payload over 125 bytes.
 ## - `BadFrame(Str)`: `send_frame!` got a frame that breaks RFC 6455.
 ## - `TooLarge(U64)`: a value over a platform limit.
 ## - `Refused(Str)`, `NotUpgrade(Str)`: opening a connection failed.
-## An outcome that is not a failure is in the `Ok` side (`TimedOut`, `Idle`).
+## An outcome that is not a failure is in the `Ok` side (`TimedOut`, `Nothing`).
+##
+## Naming: a module's `Errors` is its row of extra tags (the `e` it passes to
+## these aliases) and its `Error` the whole union, `Ws.Error(Errors)`.
 Ws :: [].{
+
+	## Every error of an effectful field: the connection has ended
+	## (`Closed`), this endpoint can no longer send and does not know the
+	## closure yet (`Closing`), or a tag of the adapter's row `e`.
+	Error(e) : [Closed(Ws.Closure), Closing, ..e]
 
 	## One whole message.
 	Message : [Text(Str), Binary(List(U8))]
@@ -51,7 +60,8 @@ Ws :: [].{
 	Opened(c) : { conn : c, protocol : Str, extensions : [Reported(List(Str)), NotReported] }
 
 	## Options of a server accepting an upgrade: the subprotocols it supports,
-	## in order of preference.
+	## in order of preference (default none), and `max_message`, the largest
+	## message accepted, in bytes.
 	AcceptOptions : { protocols ?: List(Str), max_message ?: U64 }
 
 	# ---------------------------------------------------------------- features
@@ -66,55 +76,55 @@ Ws :: [].{
 	##   ends with `Closed({ by: Us, .. })` when the peer answers. Until then,
 	##   `send!` and a second `close!` give `Closing`.
 	##   `Ws.close_and_wait!` does both.
-	Core(c, e, r) : { send! : c, Ws.Message => Try(c, [Closed(Ws.Closure), Closing, ..e]), receive! : c => Try((c, Ws.Message), [Closed(Ws.Closure), Closing, ..e]), close! : c, U16, Str => Try(c, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Core(c, e, r) : { send! : c, Ws.Message => Try(c, Ws.Error(e)), receive! : c => Try((c, Ws.Message), Ws.Error(e)), close! : c, U16, Str => Try(c, Ws.Error(e)), ..r }
 
 	## The sending half alone, for a push-model server whose messages arrive
 	## as `Handlers` calls rather than by `receive!`.
-	Sender(c, e, r) : { send! : c, Ws.Message => Try(c, [Closed(Ws.Closure), Closing, ..e]), close! : c, U16, Str => Try(c, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Sender(c, e, r) : { send! : c, Ws.Message => Try(c, Ws.Error(e)), close! : c, U16, Str => Try(c, Ws.Error(e)), ..r }
 
 	## Send a protocol-level Ping (RFC 6455 section 5.5.2), payload at most 125
 	## bytes. The peer's Pong is not reported by `receive!`; read it with
 	## `Frames`.
-	Ping(c, e, r) : { ping! : c, List(U8) => Try(c, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Ping(c, e, r) : { ping! : c, List(U8) => Try(c, Ws.Error(e)), ..r }
 
 	## Send an unsolicited Pong, a one-way heartbeat (RFC 6455 section 5.5.3).
-	Pong(c, e, r) : { pong! : c, List(U8) => Try(c, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Pong(c, e, r) : { pong! : c, List(U8) => Try(c, Ws.Error(e)), ..r }
 
 	## Frame-level access: send any frame (fragments, control frames) and read
 	## the next frame as it arrives, with no assembly and no automatic reply.
 	## A received frame that breaks the protocol fails the connection.
-	Frames(c, e, r) : { send_frame! : c, Frame => Try(c, [Closed(Ws.Closure), Closing, ..e]), receive_frame! : c => Try((c, Frame), [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Frames(c, e, r) : { send_frame! : c, Frame => Try(c, Ws.Error(e)), receive_frame! : c => Try((c, Frame), Ws.Error(e)), ..r }
 
 	## A receive that waits at most `ms` milliseconds. `TimedOut` loses
 	## nothing.
-	ReceiveWithin(c, e, r) : { receive_within! : c, U64 => Try((c, [Message(Ws.Message), TimedOut]), [Closed(Ws.Closure), Closing, ..e]), ..r }
+	ReceiveWithin(c, e, r) : { receive_within! : c, U64 => Try((c, [Message(Ws.Message), TimedOut]), Ws.Error(e)), ..r }
 
 	## A receive that waits only as long as the platform's own read deadline
-	## (a fixed time the application does not choose), then gives `Idle`.
-	## `Idle` loses nothing.
-	Poll(c, e, r) : { poll! : c => Try((c, [Message(Ws.Message), Idle]), [Closed(Ws.Closure), Closing, ..e]), ..r }
+	## (a fixed time the application does not choose), then gives `TimedOut`,
+	## as `ReceiveWithin` does. `TimedOut` loses nothing.
+	Poll(c, e, r) : { poll! : c => Try((c, [Message(Ws.Message), TimedOut]), Ws.Error(e)), ..r }
 
 	## The bytes queued for sending and not yet handed to the network.
-	Buffered(c, e, r) : { buffered_amount! : c => Try(U64, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Buffered(c, e, r) : { buffered_amount! : c => Try(U64, Ws.Error(e)), ..r }
 
 	## A fixed text reply that the runtime sends to a fixed text request by
 	## itself, without running application code (an application-level
 	## heartbeat that does not wake the server). `c` is the scope the runtime
 	## sets it for: a connection, or a whole server (every connection it
 	## holds) on a runtime that keeps one reply per server.
-	AutoResponse(c, e, r) : { set_auto_response! : c, { request : Str, response : Str } => Try(c, [Closed(Ws.Closure), Closing, ..e]), clear_auto_response! : c => Try(c, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	AutoResponse(c, e, r) : { set_auto_response! : c, { request : Str, response : Str } => Try(c, Ws.Error(e)), clear_auto_response! : c => Try(c, Ws.Error(e)), ..r }
 
 	## Per-connection state kept by the runtime, which survives the server
 	## leaving memory while the connection stays open (hibernation).
-	Persist(c, e, r) : { saved! : c => Try([Saved(List(U8)), Nothing], [Closed(Ws.Closure), Closing, ..e]), save! : c, List(U8) => Try(c, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Persist(c, e, r) : { saved! : c => Try([Saved(List(U8)), Nothing], Ws.Error(e)), save! : c, List(U8) => Try(c, Ws.Error(e)), ..r }
 
 	## Named groups of connections, with one send to every member
 	## (publish/subscribe).
-	Topics(c, e, r) : { subscribe! : c, Str => Try(c, [Closed(Ws.Closure), Closing, ..e]), unsubscribe! : c, Str => Try(c, [Closed(Ws.Closure), Closing, ..e]), publish! : c, Str, Ws.Message => Try(c, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Topics(c, e, r) : { subscribe! : c, Str => Try(c, Ws.Error(e)), unsubscribe! : c, Str => Try(c, Ws.Error(e)), publish! : c, Str, Ws.Message => Try(c, Ws.Error(e)), ..r }
 
 	## Open a client connection `c`. A server that refuses the upgrade is
 	## `Refused(Str)` in `e`.
-	Dial(c, e, r) : { connect! : Ws.Request => Try(Ws.Opened(c), [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Dial(c, e, r) : { connect! : Ws.Request => Try(Ws.Opened(c), Ws.Error(e)), ..r }
 
 	## Accept an upgrade of an incoming request `q` into a server connection
 	## `c`. `response` is the handshake response `p` that the application
@@ -122,7 +132,7 @@ Ws :: [].{
 	## returns the 101 response (the connection then lives in work that runs
 	## after it); `{}` where `accept!` writes the response itself. A request
 	## that is not a valid upgrade is `NotUpgrade(Str)` in `e`.
-	Accept(q, p, c, e, r) : { accept! : q, Ws.AcceptOptions => Try({ response : p, opened : Ws.Opened(c) }, [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Accept(q, p, c, e, r) : { accept! : q, Ws.AcceptOptions => Try({ response : p, opened : Ws.Opened(c) }, Ws.Error(e)), ..r }
 
 	## Callbacks of a push-model server, where the runtime delivers events.
 	## `s` is the application's state, threaded from call to call, and `c` the
@@ -130,9 +140,9 @@ Ws :: [].{
 	## does not keep the server in memory between events, the adapter stores
 	## `s` (for example through `Persist`) or the application keeps `s` as `{}`.
 	Handlers(s, c, e) : {
-		on_open! : s, c => Try((s, c), [Closed(Ws.Closure), Closing, ..e]),
-		on_message! : s, c, Ws.Message => Try((s, c), [Closed(Ws.Closure), Closing, ..e]),
-		on_close! : s, Ws.Closure => Try(s, [Closed(Ws.Closure), Closing, ..e]),
+		on_open! : s, c => Try((s, c), Ws.Error(e)),
+		on_message! : s, c, Ws.Message => Try((s, c), Ws.Error(e)),
+		on_close! : s, Ws.Closure => Try(s, Ws.Error(e)),
 	}
 
 	# ------------------------------------------- what the pure core needs
@@ -141,12 +151,12 @@ Ws :: [].{
 	## `read_up_to!(b, n)` gives `Data` of 1 to `n` bytes, `End` at the end of
 	## the stream, or `TimedOut` when a platform deadline passed with nothing
 	## to read (it consumes nothing).
-	Bytes(b, e, r) : { write_bytes! : b, List(U8) => Try(b, [Closed(Ws.Closure), Closing, ..e]), read_up_to! : b, U64 => Try((b, [Data(List(U8)), End, TimedOut]), [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Bytes(b, e, r) : { write_bytes! : b, List(U8) => Try(b, Ws.Error(e)), read_up_to! : b, U64 => Try((b, [Data(List(U8)), End, TimedOut]), Ws.Error(e)), ..r }
 
 	## Unpredictable bytes (RFC 6455 section 10.3) for the client's key and
 	## masks: `random_bytes!(b, n)` gives exactly `n` bytes. `b` may carry a
 	## generator's state.
-	Random(b, e, r) : { random_bytes! : b, U64 => Try((b, List(U8)), [Closed(Ws.Closure), Closing, ..e]), ..r }
+	Random(b, e, r) : { random_bytes! : b, U64 => Try((b, List(U8)), Ws.Error(e)), ..r }
 
 	# ------------------------------------------------ pre-composed aliases
 
@@ -170,7 +180,7 @@ Ws :: [].{
 
 	## The messages of a connection as a stream, until it closes. An error
 	## other than `Closed` is an `Err` item, after which the stream ends.
-	messages : { receive! : c => Try((c, Ws.Message), [Closed(Ws.Closure), Closing, ..e]), .. }, c -> Stream(Try(Ws.Message, [Closed(Ws.Closure), Closing, ..e]))
+	messages : { receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c -> Stream(Try(Ws.Message, Ws.Error(e)))
 	messages = |ops, conn| Stream.custom(
 		Going(conn),
 		Unknown,
@@ -188,7 +198,7 @@ Ws :: [].{
 	## Close and wait for the end of the closing handshake, dropping the
 	## messages that arrive meanwhile. A connection that is closing already
 	## (`close!` gives `Closing`) is waited for as it is.
-	close_and_wait! : { close! : c, U16, Str => Try(c, [Closed(Ws.Closure), Closing, ..e]), receive! : c => Try((c, Ws.Message), [Closed(Ws.Closure), Closing, ..e]), .. }, c, U16, Str => Try(Ws.Closure, [Closed(Ws.Closure), Closing, ..e])
+	close_and_wait! : { close! : c, U16, Str => Try(c, Ws.Error(e)), receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c, U16, Str => Try(Ws.Closure, Ws.Error(e))
 	close_and_wait! = |ops, conn, code, reason| {
 		var $c = match (ops.close!)(conn, code, reason) {
 			Ok(closing) => closing
@@ -209,7 +219,7 @@ Ws :: [].{
 	## Run push handlers over a pull connection until it closes: `on_open!`,
 	## `on_message!` for each message, then `on_close!`, whose state is the
 	## result.
-	drive! : { receive! : c => Try((c, Ws.Message), [Closed(Ws.Closure), Closing, ..e]), .. }, c, s, Ws.Handlers(s, c, e) => Try(s, [Closed(Ws.Closure), Closing, ..e])
+	drive! : { receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c, s, Ws.Handlers(s, c, e) => Try(s, Ws.Error(e))
 	drive! = |ops, conn, state, handlers| {
 		(s0, c0) = (handlers.on_open!)(state, conn)?
 		var $s = s0

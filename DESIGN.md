@@ -1,6 +1,6 @@
 # roc-websocket: design and platform analysis
 
-Status: version 0.0.2 is implemented in `src/` (shared types, pure core, byte-level
+Status: version 0.0.3 is implemented in `src/` (shared types, pure core, byte-level
 client) with adapters in the sibling repos `roc-basic-webserver-websocket` and
 `roc-cloudflare-workers-websocket`. Section 0 lists what the implementation settled or
 changed; where it disagrees with a later section, section 0 wins. The rest is the
@@ -20,19 +20,19 @@ Citations are `file:line`. Paths are abbreviated:
 
 ---
 
-## 0. Implementation (versions 0.0.1 and 0.0.2): settled and changed decisions
+## 0. Implementation (versions 0.0.1 to 0.0.3): settled and changed decisions
 
 ### 0.1 Modules
 
 | Module | Contents |
 | --- | --- |
-| `Ws` | `Message`, `Closure`, `Request`, `Opened(c)`, `AcceptOptions`; the feature aliases; the pre-composed aliases; `messages`, `close_and_wait!`, `drive!` (generic over any adapter's operations), `dropped` |
+| `Ws` | `Error(e)`, `Message`, `Closure`, `Request`, `Opened(c)`, `AcceptOptions`; the feature aliases; the pre-composed aliases; `messages`, `close_and_wait!`, `drive!` (generic over any adapter's operations), `dropped` |
 | `Frame` | `Frame := { fin, opcode, payload }` (`is_eq` derived), `Opcode`, `Masking`, `Expect`, `Header`; `encode`, `header`, `decode`, `mask`, `fragments`, constructors |
 | `CloseCode` | named codes, `is_sendable` (1000-1003, 1007-1014, 3000-4999), `payload`, `parse` |
 | `Base64`, `Sha1` | encode/decode; SHA-1 (FIPS 180-4) |
 | `Handshake` | `parse_url`, `client_request`, `check_response` (status, Upgrade, Connection, Sec-WebSocket-Accept, no extensions, offered subprotocol only), `parse_upgrade`, `accept_response`, `choose_protocol`, `rejection` (400/405/426), `accept_key`, `head_wanted` |
 | `Protocol` | sans-IO receive state machine, both roles: `new`, `receive : Protocol, List(U8) -> (Protocol, List(Event))`, `close`, `fail`, `ended`, `closure`, `closing`, `push`/`take_frame` (raw frames), `wanted`, `is_idle`, `is_open`, `is_done`, `masking` |
-| `Client` | `Client.Conn(b, e)` (methods `send!`, `receive!`, `poll!`, `close!`, `ping!`, `pong!`, `send_frame!`, `receive_frame!`), `Client.open!`, `Client.ops`, `Client.Errors`, `Client.Error`, `Client.Link`, `Client.Ops` |
+| `Client` | `Client.Conn(b, e)` (opaque; methods `send!`, `receive!`, `poll!`, `close!`, `ping!`, `pong!`, `send_frame!`, `receive_frame!`, `link`), `Client.open!`, `Client.ops`, `Client.default_max_message`, `Client.Errors`, `Client.Error`, `Client.Transport`, `Client.Ops` |
 
 `Assembler` and `Mask` (section 4) are not separate modules: assembly is part of
 `Protocol`, masking is `Frame.mask`.
@@ -43,19 +43,22 @@ Each effectful call takes the connection and returns the updated one with its
 result, so the protocol state carries from call to call:
 
 ```roc
+Error(e) : [Closed(Ws.Closure), Closing, ..e]
+
 Core(c, e, r) : {
-	send! : c, Ws.Message => Try(c, [Closed(Ws.Closure), Closing, ..e]),
-	receive! : c => Try((c, Ws.Message), [Closed(Ws.Closure), Closing, ..e]),
-	close! : c, U16, Str => Try(c, [Closed(Ws.Closure), Closing, ..e]),
+	send! : c, Ws.Message => Try(c, Ws.Error(e)),
+	receive! : c => Try((c, Ws.Message), Ws.Error(e)),
+	close! : c, U16, Str => Try(c, Ws.Error(e)),
 	..r
 }
 ```
 
-Every alias takes the connection type `c` first. An adapter's operations are a
+Every feature alias takes `c, e, r` in that order, after its own parameters
+(`Accept(q, p, c, e, r)`); `Handlers(s, c, e)` is a closed record. An adapter's operations are a
 record typed by the aliases it supports (`WsClient.ops : Client.Ops(...)`), and
 the connection a separate value: generic code takes both,
-`Ws.close_and_wait!(ops, conn, 1000, "")`. A client connection is the nominal
-`Client.Conn(b, e)`, so app code can also call its methods directly:
+`Ws.close_and_wait!(ops, conn, 1000, "")`. A client connection is the opaque
+`Client.Conn(b, e)` (since 0.0.3; `conn.link()` gives the link value), so app code can also call its methods directly:
 `(conn2, message) = conn.receive!()?`. A generic operations record is a
 function, `Client.ops({})`, because a value cannot be polymorphic; an adapter
 with concrete types exposes a plain value.
@@ -67,7 +70,7 @@ Check against the other platform shapes:
   else changes for such an adapter.
 - **Push `Handlers`**: `Handlers(s, c, e)` threads the application's state `s`
   and the connection through the calls: `on_message! : s, c, Ws.Message =>
-  Try((s, c), [Closed(Ws.Closure), ..e])`. `Ws.drive!` runs handlers over a pull
+  Try((s, c), Ws.Error(e))`. `Ws.drive!` runs handlers over a pull
   connection and is tested. On a runtime that drops the server between events
   (a hibernating Durable Object) the adapter persists `s` itself or the
   application keeps `s` as `{}`.
@@ -80,7 +83,7 @@ Check against the other platform shapes:
 Errors drop the connection: after an `Err` other than one the call documents as
 leaving the connection usable, the caller has only the value from before the
 call. The client never returns an error that loses state: a platform deadline is
-`Idle` in the `Ok` side of `poll!`, and `receive!` keeps waiting through it.
+`TimedOut` in the `Ok` side of `poll!` (`Idle` before 0.0.3), and `receive!` keeps waiting through it.
 
 ### 0.3 The two forced decisions of the stateless version, revisited
 
@@ -104,7 +107,7 @@ Version 0.1 had no state between calls, which forced two things. Both are gone:
 
 ### 0.4 Errors: one row shape everywhere (changes 3.2, 3.3, 3.6)
 
-Every effectful field of every alias returns `[Closed(Ws.Closure), Closing, ..e]`, with
+Every effectful field of every alias returns `Ws.Error(e)`, `[Closed(Ws.Closure), Closing, ..e]`, with
 the same `e` in every field of an adapter, including the inputs `Bytes` and
 `Random`. Fields with their own fixed tags do not work in code generic in `e`,
 verified with this compiler:
@@ -125,8 +128,10 @@ and requires the link's row to be `Client.Errors(e)`, so link errors flow into
 connection errors with no mapping. A platform adds only its own tags
 (basic-webserver: `[Tcp(Str), Connect(Str), Entropy(Str)]`). `Closed` and
 `Closing` are the shared tags (Q6 settled; `Closing` since 0.0.2, 0.10). Outcomes that are not failures are in the `Ok` side:
-`ReceiveWithin` gives `TimedOut`, `Poll` gives `Idle`, `Persist.saved!` gives
-`Nothing`.
+`ReceiveWithin` and `Poll` give `TimedOut` (one tag for "the deadline passed,
+nothing lost", whoever chose the deadline), `Persist.saved!` gives `Nothing`.
+Naming: a module's `Errors` is its row `e`, its `Error` the whole union
+(`Client.Error(e) = Ws.Error(Client.Errors(e))`).
 
 ### 0.5 Features (changes 3.3; generic, not shaped by one platform)
 
@@ -146,7 +151,8 @@ Negotiated values stay values: `Opened(c) = { conn, protocol, extensions }`, wit
 
 Pre-composed aliases: `Basic(c, e)`, `Raw(c, e)` (core, ping, pong, frames),
 `Timed(c, e)`, `Push(c, e)`, `Transport(b, e)`; the client adds `Client.Ops(b, e)`
-(`Raw` and `Poll`), `Client.Link(b, e)` and `Client.Error(e)`.
+(`Raw` and `Poll`), `Client.Transport(b, e)` (`Client.Link` before 0.0.3) and
+`Client.Error(e)`.
 
 ### 0.6 Adapters are packages (Q1 settled)
 
@@ -211,6 +217,31 @@ shared types asked for something a platform in general cannot give:
   writes the response itself uses `p = {}`.
 - **`AutoResponse` scope**, documented: `c` is the scope the runtime sets the
   reply for, a connection or a whole server.
+
+### 0.11 Changes in 0.0.3, from an audit of the API and the two adapters
+
+- **`Ws.Error(e)`** names the shared row; every alias and helper uses it.
+  Purely a name: the type is unchanged.
+- **`Poll` gives `TimedOut`**, not `Idle`. The client's `poll!` mapped the
+  link's `TimedOut` to `Idle`: two names for one outcome. `ReceiveWithin`,
+  `Poll` and `Bytes` now share `TimedOut`.
+- **`Client.Link` became `Client.Transport`**: in the client, `link` also named
+  the link value `b` (`conn.link`, the adapter's `Link` type), while
+  `Client.Link` was the operations record. `Client.Transport(b, e)` is
+  `Ws.Transport(b, Client.Errors(e))`.
+- **`Client.Conn` is opaque** (`::`): an app could build one with no handshake
+  or read its protocol state. `conn.link()` gives the link value back.
+  `Client.read_size` is private.
+- Docs: the module doc of `Ws` named only `Closed` as shared; `AcceptOptions`
+  did not document `max_message`; `Client.poll!` named a platform's deadline.
+
+Considered and kept (each a design choice, listed in the 0.0.3 audit):
+`Errors`/`Error` (one letter apart, but now a stated convention), `Dial` with the
+field `connect!`, `Ws.Request` (a client's request, while `q` in `Accept` is the
+server's), `Basic` and `Push` (one-alias compositions), `Closing` in the rows of
+receiving fields (needed so generic code mixes fields with no widening, 0.4),
+`Ws.messages` dropping the closure, and the helpers taking open records
+(`{ receive! : ..., .. }`, so an adapter's whole record passes as is).
 
 ---
 

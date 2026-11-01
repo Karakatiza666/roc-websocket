@@ -5,7 +5,7 @@ import Protocol
 
 ## A WebSocket client over a byte stream, for platforms where Roc owns the
 ## wire (TCP). The platform adapter connects the stream and gives
-## `Client.open!` its `Client.Link` operations and link value `b`; the
+## `Client.open!` its `Client.Transport` operations and link value `b`; the
 ## client does the handshake, framing, masking, fragment assembly, Ping
 ## replies and the closing handshake.
 ##
@@ -18,18 +18,23 @@ Client :: [].{
 	Errors(e) : [Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
 
 	## Every error of a client call: `Closed`, `Closing` and `Client.Errors(e)`.
-	Error(e) : [Closed(Ws.Closure), Closing, Refused(Str), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
+	Error(e) : Ws.Error(Client.Errors(e))
 
 	## What `Client.open!` needs: a byte stream and randomness over one link
 	## value `b`, whose errors are the platform's row with the client's tags.
-	Link(b, e) : Ws.Transport(b, Client.Errors(e))
+	Transport(b, e) : Ws.Transport(b, Client.Errors(e))
 
 	## The operations of a client connection as a record, for code generic
 	## over features: the core, ping, pong, frames and poll.
 	Ops(b, e) : Ws.Core(Client.Conn(b, e), Client.Errors(e), Ws.Ping(Client.Conn(b, e), Client.Errors(e), Ws.Pong(Client.Conn(b, e), Client.Errors(e), Ws.Frames(Client.Conn(b, e), Client.Errors(e), Ws.Poll(Client.Conn(b, e), Client.Errors(e), {})))))
 
-	## An open client connection over the link value `b`.
-	Conn(b, e) := { ops : Client.Link(b, e), link : b, protocol : Protocol, inbox : List(Ws.Message) }.{
+	## An open client connection over the link value `b`, from `Client.open!`.
+	Conn(b, e) :: { transport : Client.Transport(b, e), link : b, protocol : Protocol, inbox : List(Ws.Message) }.{
+
+		## The link value as the last call left it, for an adapter that needs
+		## its stream back (to close it, for example).
+		link : Client.Conn(b, e) -> b
+		link = |conn| conn.link
 
 		## Send one message, in one frame.
 		send! : Client.Conn(b, e), Ws.Message => Try(Client.Conn(b, e), Client.Error(e))
@@ -61,9 +66,9 @@ Client :: [].{
 			}
 		}
 
-		## The next message, or `Idle` when the platform's read deadline passed
-		## with no message (30 s on basic-webserver). Nothing is lost.
-		poll! : Client.Conn(b, e) => Try((Client.Conn(b, e), [Message(Ws.Message), Idle]), Client.Error(e))
+		## The next message, or `TimedOut` when the platform's read deadline
+		## passed with no message. Nothing is lost.
+		poll! : Client.Conn(b, e) => Try((Client.Conn(b, e), [Message(Ws.Message), TimedOut]), Client.Error(e))
 		poll! = |conn| {
 			var $c = conn
 			while Bool.True {
@@ -73,8 +78,8 @@ Client :: [].{
 					Err(Empty) => {}
 				}
 				(after, progress) = step!($c)?
-				if progress == Idle {
-					return Ok((after, Idle))
+				if progress == TimedOut {
+					return Ok((after, TimedOut))
 				}
 				$c = after
 			}
@@ -138,16 +143,16 @@ Client :: [].{
 						if too_big {
 							$c = apply_events!($c, $c.protocol.fail(1009, "a frame of more than ${max.to_str()} bytes"))?
 						} else {
-							(link, got) = ($c.ops.read_up_to!)($c.link, read_size)?
+							(after, got) = ($c.transport.read_up_to!)($c.link, read_size)?
 							match got {
 								Data(bytes) => {
-									$c = { ..$c, link, protocol: $c.protocol.push(bytes) }
+									$c = { ..$c, link: after, protocol: $c.protocol.push(bytes) }
 								}
 								End => {
-									$c = { ..$c, link, protocol: $c.protocol.ended().0 }
+									$c = { ..$c, link: after, protocol: $c.protocol.ended().0 }
 								}
 								TimedOut => {
-									$c = { ..$c, link }
+									$c = { ..$c, link: after }
 								}
 							}
 						}
@@ -156,10 +161,6 @@ Client :: [].{
 			}
 		}
 	}
-
-	## The bytes asked for in one read.
-	read_size : U64
-	read_size = 65536
 
 	## The largest message accepted when the request does not say: 16 MiB.
 	default_max_message : U64
@@ -183,11 +184,11 @@ Client :: [].{
 	## adapter has already connected to its host and port (and done TLS for
 	## `wss://`). A refused upgrade, the stream ending during it, or no answer
 	## before the platform's read deadline is `Refused`.
-	open! : Client.Link(b, e), b, Ws.Request => Try(Ws.Opened(Client.Conn(b, e)), Client.Error(e))
-	open! = |link_ops, link0, request| {
+	open! : Client.Transport(b, e), b, Ws.Request => Try(Ws.Opened(Client.Conn(b, e)), Client.Error(e))
+	open! = |transport, link0, request| {
 		url = Handshake.parse_url(request.url).map_err(|BadUrl(why)| Refused(why))?
 		max_message = request.?max_message ?? Client.default_max_message
-		(link1, key) = (link_ops.random_bytes!)(link0, 16)?
+		(link1, key) = (transport.random_bytes!)(link0, 16)?
 		client_request = {
 			url,
 			key,
@@ -198,22 +199,26 @@ Client :: [].{
 			Ok(text) => text
 			Err(BadKey(n)) => crash "Client.open!: random_bytes!(16) gave ${n.to_str()} bytes"
 		}
-		link2 = (link_ops.write_bytes!)(link1, head.to_utf8())?
-		(link3, response, rest) = read_head!(link_ops, link2)?
+		link2 = (transport.write_bytes!)(link1, head.to_utf8())?
+		(link3, response, rest) = read_head!(transport, link2)?
 		agreed = Handshake.check_response(response, client_request)?
-		start = Conn.{ ops: link_ops, link: link3, protocol: Protocol.new(Client, max_message), inbox: [] }
+		start = Conn.{ transport, link: link3, protocol: Protocol.new(Client, max_message), inbox: [] }
 		conn = apply_events!(start, start.protocol.receive(rest))?
 		Ok({ conn, protocol: agreed.protocol, extensions: Reported(agreed.extensions) })
 	}
 }
+
+## The bytes asked for in one read.
+read_size : U64
+read_size = 65536
 
 ## The largest response head accepted.
 max_head : U64
 max_head = 16384
 
 ## The response head, and the bytes read after it.
-read_head! : Client.Link(b, e), b => Try((b, Str, List(U8)), Client.Error(e))
-read_head! = |ops, link| {
+read_head! : Client.Transport(b, e), b => Try((b, Str, List(U8)), Client.Error(e))
+read_head! = |transport, link| {
 	var $link = link
 	var $have = []
 	while Bool.True {
@@ -228,7 +233,7 @@ read_head! = |ops, link| {
 		if $have.len() > max_head {
 			return Err(Refused("a response head of more than ${max_head.to_str()} bytes"))
 		}
-		(next, got) = (ops.read_up_to!)($link, Client.read_size)?
+		(next, got) = (transport.read_up_to!)($link, read_size)?
 		$link = next
 		match got {
 			Data(bytes) => {
@@ -277,9 +282,9 @@ next_ready = |conn| match conn.inbox {
 }
 
 ## One read, fed to the protocol.
-step! : Client.Conn(b, e) => Try((Client.Conn(b, e), [Progress, Idle]), Client.Error(e))
+step! : Client.Conn(b, e) => Try((Client.Conn(b, e), [Progress, TimedOut]), Client.Error(e))
 step! = |conn| {
-	(link, got) = (conn.ops.read_up_to!)(conn.link, Client.read_size)?
+	(link, got) = (conn.transport.read_up_to!)(conn.link, read_size)?
 	read = { ..conn, link }
 	match got {
 		Data(bytes) => {
@@ -287,7 +292,7 @@ step! = |conn| {
 			Ok((done, Progress))
 		}
 		End => Ok(({ ..read, protocol: read.protocol.ended().0 }, Progress))
-		TimedOut => Ok((read, Idle))
+		TimedOut => Ok((read, TimedOut))
 	}
 }
 
@@ -314,13 +319,13 @@ apply_events! = |conn, (protocol, events)| {
 ## Mask and write one frame.
 write_frame! : Client.Conn(b, e), Frame => Try(Client.Conn(b, e), Client.Error(e))
 write_frame! = |conn, frame| {
-	(link1, key) = (conn.ops.random_bytes!)(conn.link, 4)?
+	(link1, key) = (conn.transport.random_bytes!)(conn.link, 4)?
 	bytes = match Frame.encode(frame, Masked(key)) {
 		Ok(b) => b
 		Err(BadMask(n)) => crash "Client: random_bytes!(4) gave ${n.to_str()} bytes"
 		Err(ControlTooLong(n)) => return Err(ControlTooLong(n))
 		Err(FragmentedControl) => return Err(BadFrame("a fragmented control frame"))
 	}
-	link2 = (conn.ops.write_bytes!)(link1, bytes)?
+	link2 = (conn.transport.write_bytes!)(link1, bytes)?
 	Ok({ ..conn, link: link2 })
 }

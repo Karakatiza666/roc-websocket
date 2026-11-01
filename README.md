@@ -24,7 +24,7 @@ WebSocket (RFC 6455) for Roc, independent of any platform.
 Adapters are separate packages, such as
 [roc-basic-webserver-websocket](https://github.com/Karakatiza666/roc-basic-webserver-websocket)
 and roc-cloudflare-workers-websocket. A platform that hands out whole messages
-(Cloudflare Workers) implements `Ws.Core` directly and uses none of the pure core.
+implements `Ws.Core` directly and uses none of the pure core.
 
 ## Use
 
@@ -34,7 +34,7 @@ Add the package to the header with its release URL. The release notes of each
 ```roc
 app [...] {
 	pf: platform "...",
-	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.2/8ruw5bazzn7Xrtd3nGUTv5aGRVg3tSskgxeWbyGYsFZL.tar.zst",
+	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.3/FFY2gCnmKgndfxWwpBbtee1MYKR9K9YuzN9nEEPXG8B7.tar.zst",
 }
 
 import ws.Ws
@@ -47,35 +47,43 @@ state (bytes read past a frame, a half-received message, a pending close)
 carries from one call to the next. A platform whose host keeps the state
 returns the same handle unchanged.
 
+Code that needs a few operations takes a closed record of exactly those
+fields, so it works with every adapter that has them. `Ws.Error(e)` is the
+error union every field shares:
+
 ```roc
-## Works with any adapter: `ops` is its operations record, `conn` a connection.
-echo_once! : Ws.Core(c, e, r), c => Try(c, [Closed(Ws.Closure), Closing, ..e])
-echo_once! = |ops, conn| {
-	(conn2, message) = (ops.receive!)(conn)?
-	(ops.send!)(conn2, message)
+## Answers one message with the same message.
+echo_once! : { send! : c, Ws.Message => Try(c, Ws.Error(e)), receive! : c => Try((c, Ws.Message), Ws.Error(e)) }, c => Try(c, Ws.Error(e))
+echo_once! = |ws, conn| {
+	(conn2, message) = (ws.receive!)(conn)?
+	(ws.send!)(conn2, message)
 }
 ```
 
-A client connection from `Client.open!` also has the operations as methods:
+The app picks the fields from its adapter's operations record:
+`echo_once!({ send!: ops.send!, receive!: ops.receive! }, conn)`. A layer that
+forwards a whole adapter takes the open alias instead, `Ws.Core(c, e, r)`.
+A connection of an adapter usually has the operations as methods too:
 `conn.send!(Text("hi"))?`, `(conn2, reply) = conn.receive!()?`.
 
 `close!` starts the closing handshake; `receive!` delivers the messages still on
-their way and ends with `Err(Closed({ by: Us, .. }))`; meanwhile `send!` gives `Err(Closing)`.
-`Ws.close_and_wait!(ops, conn, 1000, "")`
-does both. `Ws.drive!(ops, conn, state, handlers)` runs push-style handlers
+their way and ends with `Err(Closed({ by: Us, .. }))`; meanwhile `send!` gives
+`Err(Closing)`. `Ws.close_and_wait!(ops, conn, CloseCode.normal, "")` does both. `Ws.drive!(ops, conn, state, handlers)` runs push-style handlers
 over a pull connection, threading `state`. `Ws.messages(ops, conn)` is a `Stream`
 of the messages.
 
 ### Features
 
-Every effectful field returns `[Closed(Ws.Closure), Closing, ..e]`. These two
-tags are shared by every adapter: `Closed(closure)` once the connection has
+Every effectful field returns `Ws.Error(e)`, which is
+`[Closed(Ws.Closure), Closing, ..e]`. These two tags are shared by every adapter: `Closed(closure)` once the connection has
 ended, `Closing` from a field that sends when this endpoint can no longer send
 and the closure is not known to it yet (the closing handshake is under way, or
 the platform gives the closure only to `receive!` or `on_close!`). `e` holds the platform's tags and the tags a feature
 adds (`InvalidClose(Str)`, `ControlTooLong(U64)`, `BadFrame(Str)`,
 `Refused(Str)`, ...). One adapter uses one `e` for all its fields. In each alias
-`c` is the connection and `r` the rest of the record.
+`c` is the connection and `r` the rest of the record. By convention a module's
+`Errors` is its row `e` and its `Error` the whole union (`Client.Errors(e)`,
+`Client.Error(e)`).
 
 | Alias | Fields |
 | --- | --- |
@@ -84,7 +92,7 @@ adds (`InvalidClose(Str)`, `ControlTooLong(U64)`, `BadFrame(Str)`,
 | `Ping(c, e, r)`, `Pong(c, e, r)` | `ping!`, `pong!` (payload at most 125 bytes) |
 | `Frames(c, e, r)` | `send_frame!`, `receive_frame!` |
 | `ReceiveWithin(c, e, r)` | `receive_within!(conn, ms)`, `TimedOut` loses nothing |
-| `Poll(c, e, r)` | `poll!`, `Idle` when the platform's own read deadline passed |
+| `Poll(c, e, r)` | `poll!`, `TimedOut` when the platform's own read deadline passed |
 | `Buffered(c, e, r)` | `buffered_amount!` |
 | `AutoResponse(c, e, r)` | a fixed text reply the runtime sends by itself; `c` is its scope (a connection or a whole server) |
 | `Persist(c, e, r)` | per-connection state that survives the server leaving memory |
@@ -96,14 +104,15 @@ adds (`InvalidClose(Str)`, `ControlTooLong(U64)`, `BadFrame(Str)`,
 
 Pre-composed: `Basic(c, e)`, `Raw(c, e)` (core, ping, pong, frames), `Timed(c, e)`,
 `Push(c, e)`, `Transport(b, e)`, and `Client.Ops(b, e)` (`Raw` and `Poll`),
-`Client.Link(b, e)`, `Client.Error(e)`.
+`Client.Transport(b, e)`, `Client.Error(e)`.
 
 ### Writing an adapter over bytes
 
-Give `Client.open!` a `Client.Link(b, e)` record and a link value `b`:
+Give `Client.open!` a `Client.Transport(b, e)` record and a link value `b`:
 `write_bytes!`, `read_up_to!` (`Data(bytes)`, `End`, or `TimedOut` for a
 platform deadline that consumed nothing) and `random_bytes!`. Connect the
-stream (and do TLS for `wss://`) before calling it.
+stream (and do TLS for `wss://`) before calling it. `conn.link()` gives the
+link value back.
 
 ### The pure core
 
@@ -129,17 +138,37 @@ state machine with no platform.
 
 ```sh
 ROC=/path/to/roc scripts/all_tests.sh   # fmt, check, expects, examples, tests/client.roc, docs
-ROC=/path/to/roc scripts/bundle.sh 0.0.2  # dist/<hash>.tar.zst and its release URL
+ROC=/path/to/roc scripts/bundle.sh 0.0.3  # dist/<hash>.tar.zst and its release URL
 ROC=/path/to/roc scripts/test_bundle.sh   # the examples and tests against the bundle
 ```
 
 124 `expect`s in `src/`: RFC 6455 vectors (the handshake key, the section 5.7
 frames, fragmentation, close codes), RFC 4648 Base64 vectors, SHA-1 vectors, and
 the protocol state machine. `tests/client.roc` runs the client over a scripted
-link (21 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
-handshake and `Closing`, `drive!`, `close_and_wait!`, refusals).
+link (22 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
+handshake and `Closing`, generic code over a closed record, `drive!`,
+`close_and_wait!`, refusals).
 
 ## Changes
+
+### 0.0.3
+
+API cleanup from an audit of the two adapters. Breaking, with the migration:
+
+- `Ws.Poll`: `poll!` gives `TimedOut`, not `Idle`, when the platform's read
+  deadline passes, the same tag as `Ws.ReceiveWithin` and `Ws.Bytes`. Match
+  `Ok((conn, TimedOut))` in place of `Ok((conn, Idle))`; an adapter that
+  implements `Poll` returns `TimedOut`.
+- `Client.Link(b, e)` is now `Client.Transport(b, e)` (the operations record
+  `Client.open!` takes; the link value is still `b`). Rename it in type
+  annotations.
+- `Client.Conn(b, e)` is opaque: its fields cannot be read or built outside
+  `Client`. `conn.link()` gives the link value (it was `conn.link`).
+- `Client.read_size` is no longer public.
+
+Added: `Ws.Error(e)`, a name for `[Closed(Ws.Closure), Closing, ..e]`, used by
+every alias; `Client.Error(e)` is `Ws.Error(Client.Errors(e))`, the same type
+as before. Writing the union out still works.
 
 ### 0.0.2
 

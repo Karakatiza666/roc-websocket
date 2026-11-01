@@ -12,7 +12,7 @@ Chunk : [Data(List(U8)), End, TimedOut]
 
 Fake : { chunks : List(Chunk), written : List(List(U8)) }
 
-fake_ops : Client.Link(Fake, [])
+fake_ops : Client.Transport(Fake, [])
 fake_ops = {
 	write_bytes!: |f, bytes| Ok({ ..f, written: f.written.append(bytes) }),
 	read_up_to!: |f, n| match f.chunks {
@@ -55,13 +55,14 @@ open! = |chunks| match Client.open!(fake_ops, { chunks, written: [] }, { url: "w
 	Err(e) => crash "open failed: ${Str.inspect(e)}"
 }
 
-## The closure of a result that is `Closed`.
+## Whether a result is `Err(Closing)`.
 is_closing : Try(x, Client.Error([])) -> Bool
 is_closing = |result| match result {
 	Err(Closing) => Bool.True
 	_ => Bool.False
 }
 
+## The closure of a result that is `Err(Closed(_))`.
 closed_with : Try(x, Client.Error([])) -> Try(Ws.Closure, [NotClosed])
 closed_with = |result| match result {
 	Err(Closed(c)) => Ok(c)
@@ -74,6 +75,14 @@ ok : Try(a, Client.Error([])) -> a
 ok = |result| match result {
 	Ok(value) => value
 	Err(e) => crash "unexpected error: ${Str.inspect(e)}"
+}
+
+## Generic over any adapter: a closed record of the two fields it needs, as
+## the README shows.
+exchange! : { send! : c, Ws.Message => Try(c, Ws.Error(e)), receive! : c => Try((c, Ws.Message), Ws.Error(e)) }, c, Ws.Message => Try((c, Ws.Message), Ws.Error(e))
+exchange! = |ws, conn, message| {
+	after = (ws.send!)(conn, message)?
+	(ws.receive!)(after)
 }
 
 check! : Str, Bool => {}
@@ -98,17 +107,17 @@ main! = |_args| {
 	(_, m3) = ok(c4.receive!())
 	check!("a timeout inside a frame keeps its bytes", m3 == Text("Hello"))
 
-	# poll! reports a timeout between messages as Idle, and keeps the state.
+	# poll! reports a timeout between messages as TimedOut, and keeps the state.
 	c5 = open!([Data(response("")), TimedOut, Data(server(Frame.text("late")))])
 	(c6, first) = ok(c5.poll!())
 	(_, second) = ok(c6.poll!())
-	check!("poll! gives Idle, then the message", first == Idle and second == Message(Text("late")))
+	check!("poll! gives TimedOut, then the message", first == TimedOut and second == Message(Text("late")))
 
 	# A fragmented message with a Ping between fragments, over three reads.
 	c7 = open!([Data(response("")), Data(server({ fin: Bool.False, opcode: Text, payload: "frag".to_utf8() })), Data(server(Frame.ping([9]))), Data(server({ fin: Bool.True, opcode: Continuation, payload: "ments".to_utf8() }))])
 	(c8, m4) = ok(c7.receive!())
 	check!("fragments assembled across reads", m4 == Text("fragments"))
-	check!("the Ping was answered", sent(c8.link) == [Frame.pong([9])])
+	check!("the Ping was answered", sent(c8.link()) == [Frame.pong([9])])
 
 	# close! returns at once; receive! delivers what is on its way, then the end.
 	c9 = open!([Data(response("")), Data(server(Frame.text("in flight")).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
@@ -118,7 +127,7 @@ main! = |_args| {
 	(c11, m5) = ok(c10.receive!())
 	check!("a message after close!", m5 == Text("in flight"))
 	check!("the closing handshake ends by us", closed_with(c11.receive!()) == Ok({ code: 1000, reason: "", clean: Bool.True, by: Us }))
-	check!("close! wrote Close 1000 bye", sent(c10.link) == [{ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8].concat("bye".to_utf8()) }])
+	check!("close! wrote Close 1000 bye", sent(c10.link()) == [{ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8].concat("bye".to_utf8()) }])
 
 	# The peer closes; later calls keep reporting the same closure.
 	c12 = open!([Data(response("")), Data(server({ fin: Bool.True, opcode: Close, payload: [0x0F, 0xA0, 104, 105] }))])
@@ -147,6 +156,9 @@ main! = |_args| {
 		on_close!: |s, closure| Ok(s.append(Text("closed ${closure.code.to_str()}"))),
 	}
 	seen = ok(Ws.drive!(ops, c13, [], handlers))
+	c17 = open!([Data(response("")), Data(server(Frame.text("reply")))])
+	(c18, reply) = ok(exchange!({ send!: ops.send!, receive!: ops.receive! }, c17, Text("ask")))
+	check!("generic code typed with Ws.Error", reply == Text("reply") and sent(c18.link()) == [Frame.text("ask")])
 	check!("drive! threads the state", seen == [Text("a"), Text("b"), Text("closed 1000")])
 	c14 = open!([Data(response("")), Data(server(Frame.text("dropped")).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
 	check!("close_and_wait!", Ws.close_and_wait!(ops, c14, 1000, "") == Ok({ code: 1000, reason: "", clean: Bool.True, by: Us }))

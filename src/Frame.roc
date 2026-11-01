@@ -22,7 +22,7 @@ Frame := { fin : Bool, opcode : Frame.Opcode, payload : List(U8) }.{
 	Header : {
 		fin : Bool,
 		opcode : Frame.Opcode,
-		mask : [Masked(List(U8)), Unmasked],
+		mask : Frame.Masking,
 		length : U64,
 
 		## Bytes of the header: 2 to 14.
