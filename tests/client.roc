@@ -192,6 +192,12 @@ main! = |_args| {
 			_ => Bool.False
 		},
 	)
+	# map_link changes only the link: the connection still works over it.
+	ml0 = open!([Data(response(""))])
+	ml1 = ml0.map_link(|f| { ..f, chunks: [Data(server(Frame.text("late")))] })
+	(ml2, late) = ok(ml1.receive!())
+	ml3 = ml2.map_link(|f| { ..f, written: f.written.append([]) })
+	check!("map_link changes the link and keeps the connection", late == Text("late") and ml3.link().written.len() == 2)
 	(_, raw) = ok(open!([Data(response("")), Data(server(Frame.pong([5])))]).receive_frame!())
 	check!("receive_frame! gives a Pong", raw == Frame.pong([5]))
 	Ok({})

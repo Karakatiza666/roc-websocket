@@ -1,6 +1,6 @@
 # roc-websocket: design and platform analysis
 
-Status: version 0.0.3 is implemented in `src/` (shared types, pure core, byte-level
+Status: version 0.0.4 is implemented in `src/` (shared types, pure core, byte-level
 client) with adapters in the sibling repos `roc-basic-webserver-websocket` and
 `roc-cloudflare-workers-websocket`. Section 0 lists what the implementation settled or
 changed; where it disagrees with a later section, section 0 wins. The rest is the
@@ -20,7 +20,7 @@ Citations are `file:line`. Paths are abbreviated:
 
 ---
 
-## 0. Implementation (versions 0.0.1 to 0.0.3): settled and changed decisions
+## 0. Implementation (versions 0.0.1 to 0.0.4): settled and changed decisions
 
 ### 0.1 Modules
 
@@ -240,6 +240,15 @@ shared types asked for something a platform in general cannot give:
 - **`Ws.messages` ends with the closure**: its last item is
   `Err(Closed(closure))`, the error that ended it, as for any other error.
   It used to end with no item, so the closure was lost.
+
+### 0.12 Changes in 0.0.4
+
+- **`Client.Conn.map_link`** (additive): `Conn(b, e), (b -> b) -> Conn(b, e)`.
+  `Conn` is opaque, so an adapter could not change its link, such as a stream's
+  read timeout for one call. `map_link` leaves the protocol state alone. An
+  adapter implements `Ws.ReceiveWithin` as `map_link` (set the timeout), then
+  `poll!`, then `map_link` (restore it). It is generic: it knows nothing about
+  what `b` holds.
 
 Considered and kept (each a design choice, listed in the 0.0.3 audit):
 `Errors`/`Error` (one letter apart, but now a stated convention), `Basic` and `Push` (one-alias compositions), `Closing` in the rows of

@@ -36,6 +36,13 @@ Client :: [].{
 		link : Client.Conn(b, e) -> b
 		link = |conn| conn.link
 
+		## The same connection with its link value changed by `change`, for an
+		## adapter that adjusts its stream between calls (a read timeout for
+		## one call, for example). The protocol state is untouched, so bytes
+		## already read and a half-received message are kept.
+		map_link : Client.Conn(b, e), (b -> b) -> Client.Conn(b, e)
+		map_link = |conn, change| { ..conn, link: change(conn.link) }
+
 		## Send one message, in one frame.
 		send! : Client.Conn(b, e), Ws.Message => Try(Client.Conn(b, e), Client.Error(e))
 		send! = |conn, message| {

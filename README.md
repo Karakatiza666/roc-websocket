@@ -34,7 +34,7 @@ Add the package to the header with its release URL. The release notes of each
 ```roc
 app [...] {
 	pf: platform "...",
-	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.3/FvsFHmH7m6LoMumXLxEHEfUoApGWdkgoFshfYEctaMNM.tar.zst",
+	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.4/FL5ikchJCgQXzACMnEovFpvUKG8uxCmGYy3zNvzbvFwd.tar.zst",
 }
 
 import ws.Ws
@@ -113,7 +113,8 @@ Give `Client.open!` a `Client.Transport(b, e)` record and a link value `b`:
 `write_bytes!`, `read_up_to!` (`Data(bytes)`, `End`, or `TimedOut` for a
 platform deadline that consumed nothing) and `random_bytes!`. Connect the
 stream (and do TLS for `wss://`) before calling it. `conn.link()` gives the
-link value back.
+link value back and `conn.map_link(change)` changes it between calls (a read
+timeout for one call, for example) without touching the protocol state.
 
 ### The pure core
 
@@ -139,18 +140,27 @@ state machine with no platform.
 
 ```sh
 ROC=/path/to/roc scripts/all_tests.sh   # fmt, check, expects, examples, tests/client.roc, docs
-ROC=/path/to/roc scripts/bundle.sh 0.0.3  # dist/<hash>.tar.zst and its release URL
+ROC=/path/to/roc scripts/bundle.sh 0.0.4  # dist/<hash>.tar.zst and its release URL
 ROC=/path/to/roc scripts/test_bundle.sh   # the examples and tests against the bundle
 ```
 
 124 `expect`s in `src/`: RFC 6455 vectors (the handshake key, the section 5.7
 frames, fragmentation, close codes), RFC 4648 Base64 vectors, SHA-1 vectors, and
 the protocol state machine. `tests/client.roc` runs the client over a scripted
-link (23 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
+link (24 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
 handshake and `Closing`, generic code over a closed record, `messages`, `drive!`,
 `close_and_wait!`, refusals).
 
 ## Changes
+
+### 0.0.4
+
+Added, non-breaking: `Client.Conn.map_link : Conn(b, e), (b -> b) -> Conn(b, e)`.
+`Conn` is opaque, so an adapter could not change its link; `map_link` applies a
+function to the link value and keeps the protocol state (bytes read past a
+frame, a half-received message, a pending close). An adapter whose stream has a
+per-call read timeout can set it, then call `poll!`, which implements
+`Ws.ReceiveWithin` exactly.
 
 ### 0.0.3
 
