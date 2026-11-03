@@ -256,6 +256,238 @@ receiving fields (needed so generic code mixes fields with no widening, 0.4),
 `Handlers(s, c, e)` with the state first, and the helpers taking open records
 (`{ receive! : ..., .. }`, so an adapter's whole record passes as is).
 
+### 0.13 The server driver over bytes
+
+This replaces the `accept!` sketch of 3.5. It is the server half of what
+`Client` is: for a platform where Roc owns the wire and accepts TCP
+connections itself (basic-cli's `Tcp.listen!`/`accept!`). The platform adapter
+accepts the TCP connection and gives the driver a byte link; the driver reads
+the HTTP upgrade request, answers it, and returns a connection that does frame
+I/O in the `Server` role.
+
+#### Module layout: `Server` beside `Client`, one private `Session` under both
+
+```
+Client  (public)  the opening handshake of a client; Client.Conn holds a Session
+Server  (public)  the opening handshake of a server; Server.Conn holds a Session
+Session (private) frame I/O over a byte link after the handshake, either role
+```
+
+After the handshake the two roles differ in two facts: the masking of a frame
+this endpoint sends (a client masks with 4 random bytes, a server does not
+mask) and the masking a received frame must have (`Protocol` checks that, from
+its role). Everything else (the read loop, leftover bytes, the inbox, Ping
+replies, the closing handshake, raw frames, `poll!`) is the same code. So it
+lives once, in a module `Session` that the package does not expose:
+
+```roc
+Session(b, e) :: {
+	bytes : Ws.Bytes(b, Session.Errors(e), {}),
+	mask! : b => Try((b, Frame.Masking), Ws.Error(Session.Errors(e))),
+	link : b,
+	protocol : Protocol,
+	inbox : List(Ws.Message),
+}
+Session.Errors(e) : [InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
+```
+
+`mask!` is the one role-specific step: the client's reads 4 bytes with
+`random_bytes!` and gives `Masked(key)`; the server's gives `Unmasked` and
+touches nothing. So the server needs no `Random` feature.
+
+`Client.Conn(b, e)` and `Server.Conn(b, e)` stay two opaque types, each
+holding a `Session` and forwarding its methods to it. Considered and rejected:
+
+- **One public `Conn` with the role inside** (`Client.Conn` and `Server.Conn`
+  aliases of one type). Less forwarding code, but a server connection would be
+  accepted where a client connection is expected, and qualified calls such as
+  `Client.Conn.send!(conn, m)` would stop resolving (an alias has no methods):
+  a breaking change with nothing gained by the user.
+- **A second copy of the client's driver in `Server`**: about 200 lines of the
+  subtlest code of the package (leftover bytes, a deadline inside a frame, the
+  1009 check before a frame's payload arrives), kept in step twice.
+
+`Client`'s public API does not change: `Client.Conn` keeps its methods, and
+`Client.Errors(e)` is the same row (`Session.Errors([Refused(Str), ..e])` is
+the same union with the tags in another order).
+
+#### API
+
+```roc
+Server :: [].{
+	## The tags the server adds to the platform's row `e`.
+	Errors(e) : [NotUpgrade(Str), InvalidStatus(U16), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
+	Error(e) : Ws.Error(Server.Errors(e))
+
+	## What the server needs from a platform: a byte stream, no randomness.
+	Transport(b, e) : Ws.Bytes(b, Server.Errors(e), {})
+
+	## The composition of Client.Ops: core, ping, pong, frames and poll.
+	Ops(b, e) : Ws.Core(Server.Conn(b, e), Server.Errors(e), Ws.Ping(..., Ws.Pong(..., Ws.Frames(..., Ws.Poll(..., {})))))
+
+	## How the application refuses an upgrade: a status from 400 to 599,
+	## extra headers (default none) and a text body (default none).
+	Refusal : { status : U16, headers ?: List(Handshake.Header), body ?: Str }
+
+	## An upgrade request read from the link and validated, not answered yet.
+	Request(b, e) :: { ... }.{
+		upgrade : Server.Request(b, e) -> Handshake.Upgrade
+		accept! : Server.Request(b, e), Ws.AcceptOptions => Try(Ws.Opened(Server.Conn(b, e)), Server.Error(e))
+		refuse! : Server.Request(b, e), Server.Refusal => Try(b, Server.Error(e))
+	}
+
+	## A server connection, with the methods of Client.Conn.
+	Conn(b, e) :: { session : Session(b, [NotUpgrade(Str), InvalidStatus(U16), ..e]) }.{
+		link, map_link, send!, receive!, poll!, close!, ping!, pong!, send_frame!, receive_frame!
+	}
+
+	read_request! : Server.Transport(b, e), b => Try(Server.Request(b, e), Server.Error(e))
+	accept! : Server.Transport(b, e), b, Ws.AcceptOptions => Try(Ws.Opened(Server.Conn(b, e)), Server.Error(e))
+	ops : {} -> Server.Ops(b, e)
+	default_max_message : U64
+	max_request_head : U64
+}
+```
+
+How it mirrors the client:
+
+| Client | Server |
+| --- | --- |
+| `Client.open!(transport, link, request : Ws.ConnectRequest)` | `Server.accept!(transport, link, options : Ws.AcceptOptions)` |
+| `Client.Transport(b, e)`: `Ws.Transport`, bytes and randomness | `Server.Transport(b, e)`: `Ws.Bytes`, bytes only |
+| `Client.Errors(e)`: `Refused(Str)` and the frame tags | `Server.Errors(e)`: `NotUpgrade(Str)`, `InvalidStatus(U16)` and the frame tags |
+| `Client.Conn(b, e)`, `Client.Ops(b, e)`, `Client.ops({})` | `Server.Conn(b, e)`, `Server.Ops(b, e)`, `Server.ops({})` |
+| an adapter's `Ws.Connect`: `connect!: \|request\| ... Client.open!(transport, link, request)` | an adapter's `Ws.Accept`: `accept!: \|q, options\| ... Server.accept!(transport, link, options)`, wrapped as `{ response: {}, opened }` |
+
+`p = {}` in `Ws.Accept`, because this server writes its 101 itself (0.10).
+
+Two levels, as the client has `Client.open!` and then the methods:
+
+- **`Server.accept!(transport, link, options)`** does everything: read the
+  request, choose the first subprotocol of the client's offer that is in
+  `options.protocols` (`Handshake.choose_protocol`; none when nothing
+  matches, never a refusal, since RFC 6455 section 4.2.2 lets a server
+  answer with no subprotocol), write the 101, and return
+  `Ws.Opened(Server.Conn(b, e))`.
+- **`Server.read_request!(transport, link)`** stops after the read, for an
+  application that looks at the request first: `request.upgrade()` has the
+  resource, `Host`, the offered subprotocols and every header. It then calls
+  `request.accept!(options)` (a choice of its own passes
+  `protocols: [chosen]`), or `request.refuse!({ status: 403, body: "..." })`,
+  which writes the refusal and gives the link back for the adapter to close.
+  A status outside 400-599 is `Err(InvalidStatus(status))` and writes
+  nothing; the request value stays usable.
+
+Extensions: the 101 never has `Sec-WebSocket-Extensions`, which is how a
+server declines every extension offered (RFC 6455 section 9.1).
+`opened.extensions` is `Reported([])`: the client's "no extensions" limit.
+
+#### Errors
+
+`Server.Errors(e)` follows the `Errors`/`Error` convention (0.4). The adapter's
+link row is `Server.Errors(e)`, so link errors flow into every result with no
+mapping, as in the client. `NotUpgrade(Str)` is the tag `Ws.Accept` documents
+for a request that is not a valid upgrade; the driver gives it after writing
+the matching answer:
+
+| Request | Answer written | Result |
+| --- | --- | --- |
+| not a valid upgrade (`Handshake.parse_upgrade`) | 400, 405, or 426 with `Sec-WebSocket-Version: 13` | `Err(NotUpgrade(why))` |
+| no end of the head within `max_request_head` bytes | 431 | `Err(NotUpgrade(why))` |
+| a head that is not UTF-8 | 400 | `Err(NotUpgrade(why))` |
+| the stream ends before the end of the head | nothing | `Err(NotUpgrade(why))` |
+| the platform's read deadline passes before the end of the head | nothing | `Err(NotUpgrade(why))` |
+| the application refuses with `refuse!` | its status, headers and body | `Ok(link)` |
+
+`InvalidStatus(U16)` is `refuse!` given a status that is not a refusal.
+`Closed`, `Closing`, `InvalidClose`, `ControlTooLong` and `BadFrame` mean what
+they mean for the client.
+
+#### Reading the request: bounds, splits, leftover bytes
+
+- **Bounded.** `max_request_head` is 16 KiB, the client's limit on a response
+  head. Each read asks for at most the bytes still allowed
+  (`max_request_head` minus what was read), so the driver never holds more
+  than 16 KiB of a request, whatever the client sends; at the limit with no
+  `\r\n\r\n` it answers 431.
+- **Split across reads.** The bytes of each read are appended and the end of
+  the head is searched from 3 bytes before the new ones, so a `\r\n\r\n` split
+  between two reads is found and each byte is scanned about once.
+- **Bytes after the head.** A client may send its first frames right behind
+  the request, in the same TCP segment. The bytes after `\r\n\r\n` stay in the
+  `Request`; `accept!` writes the 101 first and then feeds them to the
+  `Protocol`, so a first message is not lost and any frame it provokes (a
+  Pong, or the Close 1002 for an unmasked frame) is written after the 101.
+  `refuse!` drops them.
+- **Deadlines.** A read that hits the platform's deadline fails the handshake
+  (above), as the client's gives `Refused`, so an idle client holds the server
+  for at most one deadline.
+
+#### Frames in the Server role
+
+The `Protocol` in the `Server` role requires masked frames: an unmasked client
+frame fails the connection with 1002 (the Close is written, `receive!` gives
+`Closed({ code: 1002, by: Us, .. })`). Frames the server sends are unmasked:
+messages, Pongs, Close. `max_message` (from `Ws.AcceptOptions`, default
+`Server.default_max_message`, 16 MiB) fails a larger message with 1009, as in
+the client.
+
+#### Close from the server side
+
+- **The server starts it**: `conn.close!(code, reason)` writes Close and
+  returns; `receive!` delivers the messages on their way and ends with
+  `Closed({ by: Us, clean: True, .. })` when the client's Close arrives;
+  meanwhile senders give `Closing`. `Ws.close_and_wait!(Server.ops({}), ...)`
+  does both. RFC 6455 section 7.1.1 says the server closes the TCP connection
+  first once the handshake is over: that is the adapter's part (close or drop
+  the stream in `conn.link()`). Waiting for a client that never answers is
+  bounded only through `poll!`: a server that will not wait forever polls and
+  gives up after its own limit.
+- **The client starts it**: the `Protocol` echoes the code, `receive!` gives
+  `Closed({ by: Peer, clean: True, .. })`, and the adapter closes the stream.
+
+#### Push handlers
+
+Nothing new: `Ws.drive!` is generic over `{ receive! : ..., .. }`, so
+`Ws.drive!(Server.ops({}), opened.conn, state, handlers)` runs a
+`Ws.Handlers(s, Server.Conn(b, e), Server.Errors(e))` record over a server
+connection, the same call as over a client connection, and a Cloudflare
+Worker's accepted socket (a `Core` record) runs the same handlers through it.
+A handler closes with `(ops.close!)(c, code, reason)` and returns the closing
+connection; `drive!` then reads until the client answers and calls
+`on_close!`.
+
+#### What a basic-cli adapter adds
+
+A `WsServer` module in roc-basic-cli-websocket, as thin as `WsClient`:
+
+- `WsServer.Errors : [Tcp(IOErr), Interrupted]` (no `Connect`, no `Entropy`),
+  `WsServer.Link : { read : Tcp.Connection, write : Tcp.Connection }` (the
+  client's link: one socket with a read timeout and a write timeout),
+  `WsServer.Conn : Server.Conn(WsServer.Link, WsServer.Errors)`,
+  `WsServer.Error : Server.Error(WsServer.Errors)`.
+- `WsServer.transport : Server.Transport(WsServer.Link, WsServer.Errors)`: the
+  `write_bytes!` and `read_up_to!` of `WsClient.transport`, with no
+  `random_bytes!`.
+- `WsServer.accept! : Tcp.Listener, Ws.AcceptOptions, WsServer.Options => Try(Ws.Opened(WsServer.Conn), WsServer.Error)`
+  (`listener.accept!` with `accept_timeout` and `io_timeout`, then
+  `Server.accept!`), `WsServer.read_request!` for the two-step form, and
+  `WsServer.accept`, the `Ws.Accept(Tcp.Listener, {}, WsServer.Conn, ...)`
+  record.
+- `WsServer.ops` and `WsServer.receive_within!`, the client's (`map_link`
+  with a shorter read timeout, then `poll!`).
+- Serving one connection at a time is `accept!` then `Ws.drive!` in a loop.
+  Several at once is a round-robin over `poll!` with a short read timeout
+  (3.4): basic-cli has no readiness primitive, so latency grows with the
+  number of clients. That loop belongs in the adapter or the app.
+
+#### Pure-core additions
+
+`Handshake.refusal : U16, List(Handshake.Header), Str -> Str` writes any
+refusal; `Handshake.rejection(status, why)` is `refusal(status, [], why)`.
+The reason phrases cover the statuses a server refuses with (400, 401, 403,
+404, 405, 408, 426, 429, 431, 500, 503).
+
 ---
 
 ## 1. Verdict
