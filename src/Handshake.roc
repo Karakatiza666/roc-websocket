@@ -228,16 +228,49 @@ Handshake :: [].{
 	## A refusal of an upgrade: the status, `Sec-WebSocket-Version: 13` for a
 	## 426, and `why` as the body.
 	rejection : U16, Str -> Str
-	rejection = |status, why| {
+	rejection = |status, why| Handshake.refusal(status, [], why)
+
+	## A response refusing an upgrade: the status line, `Sec-WebSocket-Version: 13`
+	## for a 426 (RFC 6455 section 4.4), the extra `headers`, and `body` as
+	## plain text. It ends with `Connection: close`.
+	refusal : U16, List(Handshake.Header), Str -> Str
+	refusal = |status, headers, body| {
 		reason = match status {
 			400 => "Bad Request"
+			401 => "Unauthorized"
+			403 => "Forbidden"
+			404 => "Not Found"
 			405 => "Method Not Allowed"
+			408 => "Request Timeout"
 			426 => "Upgrade Required"
+			429 => "Too Many Requests"
+			431 => "Request Header Fields Too Large"
+			500 => "Internal Server Error"
+			503 => "Service Unavailable"
 			_ => "Error"
 		}
-		version = if (status == 426) "Sec-WebSocket-Version: 13\r\n" else ""
-		body = why.to_utf8()
-		"HTTP/1.1 ${status.to_str()} ${reason}\r\n${version}Content-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.len().to_str()}\r\nConnection: close\r\n\r\n${why}"
+		version = if (status == 426) ["Sec-WebSocket-Version: 13"] else []
+		lines = ["HTTP/1.1 ${status.to_str()} ${reason}"]
+			.concat(version)
+			.concat(headers.map(|(name, value)| "${name}: ${value}"))
+			.concat(["Content-Type: text/plain; charset=utf-8", "Content-Length: ${body.count_utf8_bytes().to_str()}", "Connection: close"])
+		"${Str.join_with(lines, "\r\n")}\r\n\r\n${body}"
+	}
+
+	## The index just after the first `\r\n\r\n` that starts at or after
+	## `from`: the end of an HTTP head and the start of the bytes after it.
+	## A reader that appends bytes searches from 3 before the new ones.
+	head_end : List(U8), U64 -> Try(U64, [NotFound])
+	head_end = |bytes, from| {
+		n = bytes.len()
+		var $i = from
+		while $i + 4 <= n {
+			if bytes.sublist({ start: $i, len: 4 }) == [13, 10, 13, 10] {
+				return Ok($i + 4)
+			}
+			$i = $i + 1
+		}
+		Err(NotFound)
 	}
 
 	## How many more bytes a reader can read without passing the end of an
@@ -347,3 +380,8 @@ expect Handshake.head_wanted("HTTP/1.1 101 OK".to_utf8()) == 4
 expect Handshake.head_wanted("x\r\n".to_utf8()) == 2
 expect Handshake.head_wanted("x\r\n\r".to_utf8()) == 1
 expect Handshake.head_wanted("x\r\n\r\n".to_utf8()) == 0
+expect Handshake.head_end("ab\r\n\r\ncd".to_utf8(), 0) == Ok(6)
+expect Handshake.head_end("ab\r\n\r\ncd".to_utf8(), 3) == Err(NotFound)
+expect Handshake.head_end("ab\r\n".to_utf8(), 0) == Err(NotFound)
+expect Handshake.rejection(426, "v") == "HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 1\r\nConnection: close\r\n\r\nv"
+expect Handshake.refusal(401, [("WWW-Authenticate", "Bearer")], "") == "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

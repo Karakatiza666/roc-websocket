@@ -1,7 +1,7 @@
 # roc-websocket: design and platform analysis
 
 Status: version 0.0.4 is implemented in `src/` (shared types, pure core, byte-level
-client) with adapters in the sibling repos `roc-basic-webserver-websocket` and
+client), and the byte-level server driver of 0.13 since (not released yet), with adapters in the sibling repos `roc-basic-webserver-websocket` and
 `roc-cloudflare-workers-websocket`. Section 0 lists what the implementation settled or
 changed; where it disagrees with a later section, section 0 wins. The rest is the
 original analysis, kept for its platform findings and citations.
@@ -30,9 +30,11 @@ Citations are `file:line`. Paths are abbreviated:
 | `Frame` | `Frame := { fin, opcode, payload }` (`is_eq` derived), `Opcode`, `Masking`, `Expect`, `Header`; `encode`, `header`, `decode`, `mask`, `fragments`, constructors |
 | `CloseCode` | named codes, `is_sendable` (1000-1003, 1007-1014, 3000-4999), `payload`, `parse` |
 | `Base64`, `Sha1` | encode/decode; SHA-1 (FIPS 180-4) |
-| `Handshake` | `parse_url`, `client_request`, `check_response` (status, Upgrade, Connection, Sec-WebSocket-Accept, no extensions, offered subprotocol only), `parse_upgrade`, `accept_response`, `choose_protocol`, `rejection` (400/405/426), `accept_key`, `head_wanted` |
-| `Protocol` | sans-IO receive state machine, both roles: `new`, `receive : Protocol, List(U8) -> (Protocol, List(Event))`, `close`, `fail`, `ended`, `closure`, `closing`, `push`/`take_frame` (raw frames), `wanted`, `is_idle`, `is_open`, `is_done`, `masking` |
-| `Client` | `Client.Conn(b, e)` (opaque; methods `send!`, `receive!`, `poll!`, `close!`, `ping!`, `pong!`, `send_frame!`, `receive_frame!`, `link`), `Client.open!`, `Client.ops`, `Client.default_max_message`, `Client.Errors`, `Client.Error`, `Client.Transport`, `Client.Ops` |
+| `Handshake` | `parse_url`, `client_request`, `check_response` (status, Upgrade, Connection, Sec-WebSocket-Accept, no extensions, offered subprotocol only), `parse_upgrade`, `accept_response`, `choose_protocol`, `rejection` (400/405/426), `refusal` (any status, headers, body), `accept_key`, `head_wanted`, `head_end` |
+| `Protocol` | sans-IO receive state machine, both roles: `new`, `receive : Protocol, List(U8) -> (Protocol, List(Event))`, `close`, `fail`, `ended`, `closure`, `closing`, `push`/`take_frame` (raw frames), `wanted`, `is_idle`, `is_open`, `is_done`, `masking`, `expects` |
+| `Client` | `Client.Conn(b, e)` (opaque; methods `send!`, `receive!`, `poll!`, `close!`, `ping!`, `pong!`, `send_frame!`, `receive_frame!`, `link`, `map_link`), `Client.open!`, `Client.ops`, `Client.default_max_message`, `Client.Errors`, `Client.Error`, `Client.Transport`, `Client.Ops` |
+| `Server` | `Server.Conn(b, e)` (opaque; the methods of `Client.Conn`), `Server.Request(b, e)` (opaque; `upgrade`, `accept!`, `refuse!`), `Server.accept!`, `Server.read_request!`, `Server.ops`, `Server.Errors`, `Server.Error`, `Server.Transport`, `Server.Ops`, `Server.Refusal`, `Server.default_max_message`, `Server.max_request_head` (0.13) |
+| `Session` | not exposed: frame I/O over a byte link after the handshake, for both roles (0.13) |
 
 `Assembler` and `Mask` (section 4) are not separate modules: assembly is part of
 `Protocol`, masking is `Frame.mask`.
@@ -173,11 +175,11 @@ over 383 bits) with `Crypto.SHA256` and uses the 32-byte digest. Unix only.
 
 ### 0.8 Not done yet
 
-A server driver (`accept!` over bytes for basic-cli; the pure parts,
-`Handshake.parse_upgrade`, `accept_response` and `Protocol` in the `Server` role,
-are done and tested), a basic-cli adapter, `wss://` in the pure client, and
-sending a message in fragments by size (the caller uses `Frame.fragments` with
-`send_frame!`).
+The server side of the basic-cli adapter (`WsServer`, 0.13; the driver is
+done), `wss://` in the pure client, sending a message in fragments by size (the
+caller uses `Frame.fragments` with `send_frame!`), extra headers on the
+server's 101, and a bounded wait for the answer to a Close (an app uses
+`poll!`).
 
 ### 0.9 Compiler issues met
 
@@ -445,6 +447,13 @@ the client.
   gives up after its own limit.
 - **The client starts it**: the `Protocol` echoes the code, `receive!` gives
   `Closed({ by: Peer, clean: True, .. })`, and the adapter closes the stream.
+- **Messages read with the client's Close**: a read is processed whole, so
+  when the client's last messages and its Close arrive in one read, the Close
+  is echoed at once. The messages are still delivered by `receive!`, but a
+  reply gives `Closed` (RFC 6455 section 5.5.1 lets an endpoint delay its echo
+  to finish sending; this one does not). The same holds for the client, and
+  `tests/server.roc` pins it. Delaying the echo until the inbox is empty
+  would be a change to the shared `Session`, for both roles.
 
 #### Push handlers
 
@@ -486,7 +495,23 @@ A `WsServer` module in roc-basic-cli-websocket, as thin as `WsClient`:
 `Handshake.refusal : U16, List(Handshake.Header), Str -> Str` writes any
 refusal; `Handshake.rejection(status, why)` is `refusal(status, [], why)`.
 The reason phrases cover the statuses a server refuses with (400, 401, 403,
-404, 405, 408, 426, 429, 431, 500, 503).
+404, 405, 408, 426, 429, 431, 500, 503). `Handshake.head_end(bytes, from)`
+finds the end of a head from an offset, for a reader that appends bytes (the
+client's and the server's head reads). `Protocol.expects` gives the masking
+a received frame must have, so `Session` checks a too-large frame header for
+either role (the client's code assumed unmasked frames).
+
+#### Tests
+
+`tests/server.roc` drives the server over a scripted link, and a client and
+a server wired together in memory: the client's link runs `Server.accept!`
+on what the client wrote when it first reads, so `Client.open!` reads the
+server's real 101; after that a test moves the written bytes from one end to
+the other. A link can be set to fail its writes with the bytes it was given,
+which is how a test sees what a call wrote before it ended in an error (a
+refusal before `NotUpgrade`, a Close echo before `Closed`): an error drops the
+connection value (0.2), and with a link that is a pure value the bytes go
+with it.
 
 ---
 

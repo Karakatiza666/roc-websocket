@@ -4,7 +4,7 @@ WebSocket (RFC 6455) for Roc, independent of any platform.
 
 | Item | Value |
 | --- | --- |
-| Modules | `Ws` (shared types and features), `Client`, `Protocol`, `Handshake`, `Frame`, `CloseCode`, `Base64`, `Sha1` |
+| Modules | `Ws` (shared types and features), `Client`, `Server`, `Protocol`, `Handshake`, `Frame`, `CloseCode`, `Base64`, `Sha1` |
 | Dependencies | none |
 | Compiler | the Zig compiler (2026 nightlies). `.roc-version` names the nightly for CI. |
 | Tests | `scripts/all_tests.sh` |
@@ -20,6 +20,9 @@ WebSocket (RFC 6455) for Roc, independent of any platform.
   answers pings and runs the closing handshake (`Protocol`).
 - **A client over bytes** (`Client`) for platforms where Roc owns the TCP
   connection. The platform adapter supplies a byte stream and randomness.
+- **A server over bytes** (`Server`) for platforms where Roc accepts TCP
+  connections itself. The platform adapter supplies a byte stream; no
+  randomness.
 
 Adapters are separate packages, such as
 [roc-basic-webserver-websocket](https://github.com/Karakatiza666/roc-basic-webserver-websocket)
@@ -105,7 +108,7 @@ adds (`InvalidClose(Str)`, `ControlTooLong(U64)`, `BadFrame(Str)`,
 
 Pre-composed: `Basic(c, e)`, `Raw(c, e)` (core, ping, pong, frames), `Timed(c, e)`,
 `Push(c, e)`, `Transport(b, e)`, and `Client.Ops(b, e)` (`Raw` and `Poll`),
-`Client.Transport(b, e)`, `Client.Error(e)`.
+`Client.Transport(b, e)`, `Client.Error(e)`, with the same three for `Server`.
 
 ### Writing an adapter over bytes
 
@@ -115,6 +118,44 @@ platform deadline that consumed nothing) and `random_bytes!`. Connect the
 stream (and do TLS for `wss://`) before calling it. `conn.link()` gives the
 link value back and `conn.map_link(change)` changes it between calls (a read
 timeout for one call, for example) without touching the protocol state.
+
+### A server over bytes
+
+The adapter accepts a TCP connection and gives `Server.accept!` a
+`Server.Transport(b, e)` record (`write_bytes!` and `read_up_to!`, no
+`random_bytes!`) and the link value `b`:
+
+```roc
+opened = Server.accept!(transport, link, { protocols: ["chat"], max_message: 1024 * 1024 })?
+# opened.protocol: the first subprotocol of the client's offer that is in `protocols`, or ""
+_ = Ws.drive!(Server.ops({}), opened.conn, state, handlers)?
+```
+
+- `Server.accept! : Server.Transport(b, e), b, Ws.AcceptOptions => Try(Ws.Opened(Server.Conn(b, e)), Server.Error(e))`
+  reads the upgrade request, writes the 101 and returns the connection. No
+  extension is accepted (`extensions` is `Reported([])`).
+- `Server.read_request! : Server.Transport(b, e), b => Try(Server.Request(b, e), Server.Error(e))`
+  stops after reading, for an app that decides from the request:
+  `request.upgrade()` gives its resource, `Host`, offered subprotocols and
+  headers (`Handshake.Upgrade`); then `request.accept!(options)`, or
+  `request.refuse!({ status: 403, headers: [...], body: "..." }) : Try(b, ...)`,
+  which writes the refusal and gives the link back.
+- `Server.Conn(b, e)` has the methods of `Client.Conn` (`send!`, `receive!`,
+  `poll!`, `close!`, `ping!`, `pong!`, `send_frame!`, `receive_frame!`,
+  `link`, `map_link`); `Server.ops({})` is the record (`Server.Ops(b, e)`).
+  Frames it sends are unmasked; a client frame that is not masked fails the
+  connection with 1002.
+- `Server.Errors(e) = [NotUpgrade(Str), InvalidStatus(U16), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]`.
+  `NotUpgrade(why)`: the request was not a valid upgrade, and the server has
+  answered it (400, 405, 426, or 431 for a head over
+  `Server.max_request_head`, 16 KiB), or the stream ended or the platform's
+  deadline passed before the end of the head (nothing written).
+  `InvalidStatus(status)`: `refuse!` with a status outside 400-599.
+
+The request read is bounded by `Server.max_request_head`, handles a request
+split across reads, and keeps bytes sent behind the head as the first frames.
+`close!` starts the closing handshake as in the client; once `receive!` gives
+`Closed`, the adapter closes the stream (`conn.link()`).
 
 ### The pure core
 
@@ -126,32 +167,57 @@ expect Handshake.accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZ
 ```
 
 `examples/sans_io.roc` runs a server handshake and a few frames through the
-state machine with no platform.
+state machine with no platform; `examples/echo_server.roc` runs `Server.accept!`
+and `Ws.drive!` over a scripted link.
 
 ## Limits
 
 - No extensions: `permessage-deflate` is never offered, and a server that picks
   one is refused.
-- No server driver yet. The server handshake (`Handshake.parse_upgrade`,
-  `accept_response`) and `Protocol` in the `Server` role are done and tested.
+- The server answers one connection per `accept!`; serving several at once
+  (a loop over `poll!`, or threads) is the adapter's or the app's. The 101
+  has no extra headers.
+- A server waiting for the client's answer to its Close is bounded only
+  through `poll!`, by the app.
 - `DESIGN.md` has the design, the platform analysis and what is left.
 
 ## Tests
 
 ```sh
-ROC=/path/to/roc scripts/all_tests.sh   # fmt, check, expects, examples, tests/client.roc, docs
+ROC=/path/to/roc scripts/all_tests.sh   # fmt, check, expects, examples, tests/, docs
 ROC=/path/to/roc scripts/bundle.sh 0.0.4  # dist/<hash>.tar.zst and its release URL
 ROC=/path/to/roc scripts/test_bundle.sh   # the examples and tests against the bundle
 ```
 
-124 `expect`s in `src/`: RFC 6455 vectors (the handshake key, the section 5.7
+129 `expect`s in `src/`: RFC 6455 vectors (the handshake key, the section 5.7
 frames, fragmentation, close codes), RFC 4648 Base64 vectors, SHA-1 vectors, and
 the protocol state machine. `tests/client.roc` runs the client over a scripted
 link (24 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
 handshake and `Closing`, generic code over a closed record, `messages`, `drive!`,
-`close_and_wait!`, refusals).
+`close_and_wait!`, refusals). `tests/server.roc` runs the server (47 checks: a
+request split across reads, the bounded read and 431, bad upgrades, refusals,
+the subprotocol choice, extensions declined, unmasked client frames failing
+with 1002, Ping and Pong, a close by either side, `drive!`), and a client and a
+server wired together in memory.
 
 ## Changes
+
+### Unreleased
+
+Added, non-breaking:
+
+- `Server`: `Server.accept!`, `Server.read_request!`, `Server.Request(b, e)`
+  (`upgrade`, `accept!`, `refuse!`), `Server.Conn(b, e)`, `Server.ops`,
+  `Server.Ops`, `Server.Transport`, `Server.Errors`, `Server.Error`,
+  `Server.Refusal`, `Server.default_max_message`, `Server.max_request_head`.
+- `Handshake.refusal(status, headers, body)`, any refusal response
+  (`Handshake.rejection` is `refusal(status, [], why)`, and its output is
+  unchanged), with reason phrases for 401, 403, 404, 408, 429, 431, 500 and
+  503; `Handshake.head_end(bytes, from)`.
+- `Protocol.expects`, the masking a received frame must have.
+
+`Client.Conn` now holds the frame I/O that it shares with `Server.Conn`; its
+methods, types and behaviour are unchanged.
 
 ### 0.0.4
 

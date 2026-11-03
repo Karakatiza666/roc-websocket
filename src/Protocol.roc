@@ -84,6 +84,11 @@ Protocol :: {
 		Server => Unmasked
 	}
 
+	## The masking a received frame must have: a server expects masked frames,
+	## a client unmasked ones.
+	expects : Protocol -> Frame.Expect
+	expects = |p| expected(p)
+
 	## Feed received bytes, any number of them.
 	receive : Protocol, List(U8) -> (Protocol, List(Protocol.Event))
 	receive = |p, bytes| {
