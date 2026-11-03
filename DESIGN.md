@@ -1,8 +1,9 @@
 # roc-websocket: design and platform analysis
 
-Status: version 0.0.4 is implemented in `src/` (shared types, pure core, byte-level
-client), and the byte-level server driver of 0.13 since (not released yet), with adapters in the sibling repos `roc-basic-webserver-websocket` and
-`roc-cloudflare-workers-websocket`. Section 0 lists what the implementation settled or
+Status: version 0.0.5 is implemented in `src/` (shared types, pure core, byte-level
+client, and the byte-level server driver of 0.13; the API changes of 0.0.5 are
+0.14), with adapters in the sibling repos `roc-basic-webserver-websocket`,
+`roc-basic-cli-websocket` and `roc-cloudflare-workers-websocket`. Section 0 lists what the implementation settled or
 changed; where it disagrees with a later section, section 0 wins. The rest is the
 original analysis, kept for its platform findings and citations.
 
@@ -20,20 +21,20 @@ Citations are `file:line`. Paths are abbreviated:
 
 ---
 
-## 0. Implementation (versions 0.0.1 to 0.0.4): settled and changed decisions
+## 0. Implementation (versions 0.0.1 to 0.0.5): settled and changed decisions
 
 ### 0.1 Modules
 
 | Module | Contents |
 | --- | --- |
-| `Ws` | `Error(e)`, `Message`, `Closure`, `ConnectRequest`, `Opened(c)`, `AcceptOptions`; the feature aliases; the pre-composed aliases; `messages`, `close_and_wait!`, `drive!` (generic over any adapter's operations), `dropped` |
+| `Ws` | `Error(e)`, `Message`, `Closure`, `ConnectRequest`, `Opened(c)`, `AcceptOptions`, `Upgrade`, `Refusal`; the feature aliases; the pre-composed aliases; `messages`, `close_and_wait!`, `drive!` (generic over any adapter's operations), `dropped` |
 | `Frame` | `Frame := { fin, opcode, payload }` (`is_eq` derived), `Opcode`, `Masking`, `Expect`, `Header`; `encode`, `header`, `decode`, `mask`, `fragments`, constructors |
 | `CloseCode` | named codes, `is_sendable` (1000-1003, 1007-1014, 3000-4999), `payload`, `parse` |
 | `Base64`, `Sha1` | encode/decode; SHA-1 (FIPS 180-4) |
-| `Handshake` | `parse_url`, `client_request`, `check_response` (status, Upgrade, Connection, Sec-WebSocket-Accept, no extensions, offered subprotocol only), `parse_upgrade`, `accept_response`, `choose_protocol`, `rejection` (400/405/426), `refusal` (any status, headers, body), `accept_key`, `head_wanted`, `head_end` |
+| `Handshake` | `parse_url`, `client_request`, `check_response` (status, Upgrade, Connection, Sec-WebSocket-Accept, no extensions, offered subprotocol only), `parse_upgrade`, `accept_response`, `choose_protocol`, `rejection` (400/405/426), `refusal` (any final status, headers, body), `accept_key`, `head_wanted`, `head_end` |
 | `Protocol` | sans-IO receive state machine, both roles: `new`, `receive : Protocol, List(U8) -> (Protocol, List(Event))`, `close`, `fail`, `ended`, `closure`, `closing`, `push`/`take_frame` (raw frames), `wanted`, `is_idle`, `is_open`, `is_done`, `masking`, `expects` |
 | `Client` | `Client.Conn(b, e)` (opaque; methods `send!`, `receive!`, `poll!`, `close!`, `ping!`, `pong!`, `send_frame!`, `receive_frame!`, `link`, `map_link`), `Client.open!`, `Client.ops`, `Client.default_max_message`, `Client.Errors`, `Client.Error`, `Client.Transport`, `Client.Ops` |
-| `Server` | `Server.Conn(b, e)` (opaque; the methods of `Client.Conn`), `Server.Request(b, e)` (opaque; `upgrade`, `accept!`, `refuse!`), `Server.accept!`, `Server.read_request!`, `Server.ops`, `Server.Errors`, `Server.Error`, `Server.Transport`, `Server.Ops`, `Server.Refusal`, `Server.default_max_message`, `Server.max_request_head` (0.13) |
+| `Server` | `Server.Conn(b, e)` (opaque; the methods of `Client.Conn`), `Server.Request(b, e)` (opaque; `upgrade`, `accept!`, `refuse!`, `map_link`), `Server.accept!`, `Server.read_request!`, `Server.ops`, `Server.Errors`, `Server.Error`, `Server.Transport`, `Server.Ops`, `Server.default_max_message`, `Server.max_request_head` (0.13) |
 | `Session` | not exposed: frame I/O over a byte link after the handshake, for both roles (0.13) |
 
 `Assembler` and `Mask` (section 4) are not separate modules: assembly is part of
@@ -175,8 +176,7 @@ over 383 bits) with `Crypto.SHA256` and uses the 32-byte digest. Unix only.
 
 ### 0.8 Not done yet
 
-The server side of the basic-cli adapter (`WsServer`, 0.13; the driver is
-done), `wss://` in the pure client, sending a message in fragments by size (the
+`wss://` in the pure client, sending a message in fragments by size (the
 caller uses `Frame.fragments` with `send_frame!`), extra headers on the
 server's 101, and a bounded wait for the answer to a Close (an app uses
 `poll!`).
@@ -327,15 +327,12 @@ Server :: [].{
 	## The composition of Client.Ops: core, ping, pong, frames and poll.
 	Ops(b, e) : Ws.Core(Server.Conn(b, e), Server.Errors(e), Ws.Ping(..., Ws.Pong(..., Ws.Frames(..., Ws.Poll(..., {})))))
 
-	## How the application refuses an upgrade: a status from 400 to 599,
-	## extra headers (default none) and a text body (default none).
-	Refusal : { status : U16, headers ?: List(Handshake.Header), body ?: Str }
-
 	## An upgrade request read from the link and validated, not answered yet.
 	Request(b, e) :: { ... }.{
-		upgrade : Server.Request(b, e) -> Handshake.Upgrade
+		upgrade : Server.Request(b, e) -> Ws.Upgrade
 		accept! : Server.Request(b, e), Ws.AcceptOptions => Try(Ws.Opened(Server.Conn(b, e)), Server.Error(e))
-		refuse! : Server.Request(b, e), Server.Refusal => Try(b, Server.Error(e))
+		refuse! : Server.Request(b, e), Ws.Refusal => Try(b, Server.Error(e))
+		map_link : Server.Request(b, e), (b -> b) -> Server.Request(b, e)
 	}
 
 	## A server connection, with the methods of Client.Conn.
@@ -366,19 +363,20 @@ How it mirrors the client:
 Two levels, as the client has `Client.open!` and then the methods:
 
 - **`Server.accept!(transport, link, options)`** does everything: read the
-  request, choose the first subprotocol of the client's offer that is in
-  `options.protocols` (`Handshake.choose_protocol`; none when nothing
-  matches, never a refusal, since RFC 6455 section 4.2.2 lets a server
-  answer with no subprotocol), write the 101, and return
+  request, choose the first subprotocol of `options.protocols` (the server's
+  order of preference) that the client offered (`Handshake.choose_protocol`;
+  none when nothing matches, never a refusal, since RFC 6455 section 4.2.2
+  lets a server answer with no subprotocol), write the 101, and return
   `Ws.Opened(Server.Conn(b, e))`.
 - **`Server.read_request!(transport, link)`** stops after the read, for an
-  application that looks at the request first: `request.upgrade()` has the
-  resource, `Host`, the offered subprotocols and every header. It then calls
-  `request.accept!(options)` (a choice of its own passes
-  `protocols: [chosen]`), or `request.refuse!({ status: 403, body: "..." })`,
-  which writes the refusal and gives the link back for the adapter to close.
-  A status outside 400-599 is `Err(InvalidStatus(status))` and writes
-  nothing; the request value stays usable.
+  application that looks at the request first: `request.upgrade()` is a `Ws.Upgrade`,
+  the resource, `Host`, the offered subprotocols and every header. It then
+  calls `request.accept!(options)` (a choice of its own passes
+  `protocols: [chosen]`), or `request.refuse!({ status: 403, body: "..." })`
+  with a `Ws.Refusal`, which writes the refusal and gives the link back for
+  the adapter to close. Any final status refuses (200-599, 0.14); one
+  outside that is `Err(InvalidStatus(status))` and writes nothing; the
+  request value stays usable.
 
 Extensions: the 101 never has `Sec-WebSocket-Extensions`, which is how a
 server declines every extension offered (RFC 6455 section 9.1).
@@ -401,7 +399,8 @@ the matching answer:
 | the platform's read deadline passes before the end of the head | nothing | `Err(NotUpgrade(why))` |
 | the application refuses with `refuse!` | its status, headers and body | `Ok(link)` |
 
-`InvalidStatus(U16)` is `refuse!` given a status that is not a refusal.
+`InvalidStatus(U16)` is `refuse!` given a status that is not a final HTTP
+status (outside 200-599: a 1xx, 101 among them, or no HTTP status).
 `Closed`, `Closing`, `InvalidClose`, `ControlTooLong` and `BadFrame` mean what
 they mean for the client.
 
@@ -447,7 +446,7 @@ the client.
   gives up after its own limit.
 - **The client starts it**: the `Protocol` echoes the code, `receive!` gives
   `Closed({ by: Peer, clean: True, .. })`, and the adapter closes the stream.
-- **Messages read with the client's Close** (changed on `server-revisions`):
+- **Messages read with the client's Close** (0.0.5, both roles):
   when the peer's last messages and its Close arrive in one read, `Session`
   holds the echo until those messages are delivered. Sending stays allowed
   while it is held, so replies to them go out before the echo; the next
@@ -460,12 +459,16 @@ the client.
   closes in one write). It also matches a push platform, where the runtime
   delivers the messages before the close event and replies to them succeed.
   A Close that comes with no message before it is still echoed at once, and
-  a Close of a failed connection (by `Us`) is never held.
+  a Close of a failed connection (by `Us`) is never held. The cost: an app
+  that stops reading after the last message (no `receive!`, `poll!`,
+  `receive_frame!` or `close!` again) sends no echo, and the peer sees the
+  stream end with no Close; an app over `Ws.drive!` always reads on.
 - **`Ws.drive!` and a handler's `Closed`**: a handler that fails with
   `Closed` sent on a connection that had already ended (a protocol failure
   read with its message, for example). `drive!` then reads on from the
   connection it gave the handler, which delivers the messages left and the
-  closure, and calls `on_close!`; other handler errors end the run.
+  closure, and calls `on_close!`; other handler errors end the run, with the
+  state (0.14).
 - **`Server.Request.map_link`**: an adapter reads the request with a short
   handshake deadline and restores the connection's read timeout before it
   hands out the request, so a request needs no adapter wrapper.
@@ -479,7 +482,8 @@ connection, the same call as over a client connection, and a Cloudflare
 Worker's accepted socket (a `Core` record) runs the same handlers through it.
 A handler closes with `(ops.close!)(c, code, reason)` and returns the closing
 connection; `drive!` then reads until the client answers and calls
-`on_close!`.
+`on_close!(s, c, closure)`. It returns `(s, Try(Ws.Closure, Ws.Error(e)))`
+(0.14).
 
 #### What a basic-cli adapter adds
 
@@ -527,6 +531,84 @@ which is how a test sees what a call wrote before it ended in an error (a
 refusal before `NotUpgrade`, a Close echo before `Closed`): an error drops the
 connection value (0.2), and with a link that is a pure value the bytes go
 with it.
+
+### 0.14 Changes in 0.0.5
+
+Each change was checked against both server adapters built on 0.13, the
+byte-level one (roc-basic-cli-websocket) and Cloudflare Workers
+(roc-cloudflare-workers-websocket), so none is shaped by one platform.
+
+- **The Close echo is held** while messages read with it wait in the inbox
+  (0.13, "Close from the server side"), in `Session`, so for both roles. On
+  Workers the runtime already delivers the messages before the close event,
+  so this makes the byte drivers behave as Workers does. The cost is
+  documented: an app that never reads again sends no echo.
+- **`Ws.drive!` reads on after a handler's `Closed`** (0.13).
+- **The subprotocol follows the server's order of preference**:
+  `Handshake.choose_protocol` is
+  `supported.find_first(|p| offered.contains(p))`. `Ws.AcceptOptions` already
+  said "in order of preference", and Workers' `pick_protocol` already chose
+  this way; the byte server chose by the client's order. RFC 6455 section
+  4.2.2 leaves the choice to the server.
+- **Shared data types, not a shared act.** `Ws.Upgrade : { resource, host,
+  protocols, headers }` is what a server sees of a request
+  (`Handshake.Upgrade` without `key`, which only the 101 needs), and
+  `Server.Request.upgrade()` returns it. `Ws.Refusal : { status, headers ?:,
+  body ?: }` is how it refuses; `Server.Refusal` (never released) is gone.
+  There is no shared `refuse!` feature alias: refusing is platform-specific,
+  a Worker returns a `Response` from its request handler while the byte
+  server writes bytes and gives the link back, so one field type would fit
+  neither.
+- **`refuse!` takes any final status**, 200 to 599. RFC 6455 section 4.2.2
+  lets a server answer with any status but 101 (a 3xx redirect, a 401 with
+  `WWW-Authenticate`). The check left is what an HTTP response needs: a 1xx
+  is an interim response, which cannot carry the body or end the exchange
+  (RFC 9110 section 15.2), and a number past 599 is no status. Workers'
+  `Response` constructor takes the same range (200 to 599). `InvalidStatus`
+  keeps its name, with the narrower meaning. `Handshake.refusal` has reason
+  phrases for 200 and the redirects, and an empty one for an unknown status
+  below 400 (allowed by RFC 9112 section 4).
+- **`max_message` is documented**: omitted, the adapter's limit applies
+  (16 MiB over bytes); exceeding it closes with 1009, `by: Us`,
+  `clean: False`.
+- **`Server.Request.map_link`** (0.13).
+- **Breaking: `on_close!` gets the connection**, `on_close! : s, c,
+  Ws.Closure => Try(s, Ws.Error(e))`, with `c` after `s` as in `on_open!` and
+  `on_message!`. The connection has ended, so it is for what the value
+  holds: the byte adapter's link to close, a connection id to forget, a
+  `Persist` attachment. It returns no connection, since nothing follows.
+  `drive!` passes the connection as the last successful call left it (the
+  `receive!` that gave `Closed` returned no value).
+- **Breaking: `Ws.drive!` returns the state with its result**,
+  `(s, Try(Ws.Closure, Ws.Error(e)))`. Before, an error lost the state of
+  every handler run so far, which an app that persists or reports its state
+  needs most then. The shape, against the alternatives:
+  - `Try((s, Ws.Closure), (s, Ws.Error(e)))` keeps `?`, but a `?` would
+    return the pair as the caller's error, which does not join the caller's
+    open tag row; every caller would have to map it.
+  - `{ state : s, end : Try(...) }` reads well too, but the package returns
+    pairs everywhere else (`(c, Ws.Message)`), and a pair destructures in
+    one line.
+  - The chosen pair: `(state, ended) = Ws.drive!(...)`, then `closure =
+    ended?` or a `match`. The state is always there; the result is a plain
+    `Try` that `?` and `match` take as they are. `Ok` carries the closure,
+    which `on_close!` saw too, for a caller with no closure handling of its
+    own. With `Err`, the state is the last one a handler returned (the
+    initial state when `on_open!` fails).
+
+Considered and not done:
+
+- **`Ws.turn!`**, one step of `drive!` (one receive, one handler call),
+  returning the state and the connection, so a pull loop over several
+  connections (basic-cli's round-robin over `poll!`) could run the same
+  handlers one event at a time. It is an open idea: the round-robin is the
+  adapter's or the app's (0.13), and the step's shape (what it returns when
+  the connection has ended, how a `TimedOut` poll fits) waits for that loop.
+- **Broadcast in pull loops**: a server that holds several pull connections
+  and sends one message to all of them, as `Ws.Topics` does on a push
+  platform. Over bytes it is a loop over the connections the app holds,
+  with each send's new value kept; whether the package should give a helper
+  waits for `Ws.turn!` and a multi-connection adapter.
 
 ---
 
@@ -761,6 +843,10 @@ drive! : Core(x, {}), Handlers(Core(x, {}), e) => Try({}, [Handler(e), Closed(Cl
   hosted list in `cli/main.roc:114-130`, which has no poll).
 
 State in handlers is open question Q3.
+
+(Superseded by 0.0.5: `Ws.Handlers(s, c, e)` threads a state `s`, `on_close!`
+gets the connection, and `Ws.drive!` returns `(s, Try(Ws.Closure,
+Ws.Error(e)))`; see 0.13 "Push handlers" and 0.14.)
 
 ### 3.5 Opening connections
 

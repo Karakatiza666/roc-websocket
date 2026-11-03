@@ -37,7 +37,7 @@ Add the package to the header with its release URL. The release notes of each
 ```roc
 app [...] {
 	pf: platform "...",
-	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.4/FL5ikchJCgQXzACMnEovFpvUKG8uxCmGYy3zNvzbvFwd.tar.zst",
+	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.5/AKLgwxjBQN2XkE4G5sZtzrjPSxhwo6XmJRSPdWhpgVUN.tar.zst",
 }
 
 import ws.Ws
@@ -71,10 +71,33 @@ A connection of an adapter usually has the operations as methods too:
 
 `close!` starts the closing handshake; `receive!` delivers the messages still on
 their way and ends with `Err(Closed({ by: Us, .. }))`; meanwhile `send!` gives
-`Err(Closing)`. `Ws.close_and_wait!(ops, conn, CloseCode.normal, "")` does both. `Ws.drive!(ops, conn, state, handlers)` runs push-style handlers
-over a pull connection, threading `state`. `Ws.messages(ops, conn)` is a `Stream`
-of the messages whose last item is the error that ended it, `Err(Closed(closure))`
-at the end of the connection.
+`Err(Closing)`. `Ws.close_and_wait!(ops, conn, CloseCode.normal, "")` does both.
+`Ws.messages(ops, conn)` is a `Stream` of the messages whose last item is the
+error that ended it, `Err(Closed(closure))` at the end of the connection.
+
+`Ws.drive!(ops, conn, state, handlers)` runs push-style handlers
+(`Ws.Handlers(s, c, e)`) over a pull connection, threading `state`. It returns
+the state together with how the run ended, so an error does not lose it:
+
+```roc
+handlers = {
+	on_open!: |count, conn| Ok((count, conn)),
+	on_message!: |count, conn, message| match conn.send!(message) {
+		Ok(sent) => Ok((count + 1, sent))
+		Err(err) => Err(err)
+	},
+	on_close!: |count, _conn, _closure| Ok(count),
+}
+(count, ended) = Ws.drive!(ops, conn, 0, handlers)
+# count: the state of on_close!, or of the last handler that succeeded
+closure = ended?
+```
+
+`ended` is `Ok(closure)` after `on_close!` ran, or `Err(err)` for a handler's
+error (other than `Closed`, which only ends the sending: `drive!` delivers the
+messages left and calls `on_close!`) or an error of `receive!`. `on_close!`
+gets the connection as the last call left it, for what the value holds (a link
+to close, an id to forget).
 
 ### Features
 
@@ -127,8 +150,8 @@ The adapter accepts a TCP connection and gives `Server.accept!` a
 
 ```roc
 opened = Server.accept!(transport, link, { protocols: ["chat"], max_message: 1024 * 1024 })?
-# opened.protocol: the first subprotocol of the client's offer that is in `protocols`, or ""
-_ = Ws.drive!(Server.ops({}), opened.conn, state, handlers)?
+# opened.protocol: the first of `protocols` (the server's preference) that the client offered, or ""
+(state2, ended) = Ws.drive!(Server.ops({}), opened.conn, state, handlers)
 ```
 
 - `Server.accept! : Server.Transport(b, e), b, Ws.AcceptOptions => Try(Ws.Opened(Server.Conn(b, e)), Server.Error(e))`
@@ -137,9 +160,11 @@ _ = Ws.drive!(Server.ops({}), opened.conn, state, handlers)?
 - `Server.read_request! : Server.Transport(b, e), b => Try(Server.Request(b, e), Server.Error(e))`
   stops after reading, for an app that decides from the request:
   `request.upgrade()` gives its resource, `Host`, offered subprotocols and
-  headers (`Handshake.Upgrade`); then `request.accept!(options)`, or
-  `request.refuse!({ status: 403, headers: [...], body: "..." }) : Try(b, ...)`,
-  which writes the refusal and gives the link back. `request.map_link(change)`
+  headers (`Ws.Upgrade`, names lowercased); then `request.accept!(options)`,
+  or `request.refuse!({ status: 403, headers: [...], body: "..." }) : Try(b, ...)`
+  (a `Ws.Refusal`), which writes the refusal and gives the link back. Any
+  final status refuses, 200 to 599: a 3xx with a `Location` header, a 401
+  with `WWW-Authenticate`, a 4xx or 5xx. `request.map_link(change)`
   changes the link before either, so an adapter can read the request with a
   short handshake deadline and hand out a request whose connection reads with
   its normal one.
@@ -153,7 +178,8 @@ _ = Ws.drive!(Server.ops({}), opened.conn, state, handlers)?
   answered it (400, 405, 426, or 431 for a head over
   `Server.max_request_head`, 16 KiB), or the stream ended or the platform's
   deadline passed before the end of the head (nothing written).
-  `InvalidStatus(status)`: `refuse!` with a status outside 400-599.
+  `InvalidStatus(status)`: `refuse!` with a status outside 200-599 (a 1xx,
+  101 among them, ends no HTTP exchange), nothing written.
 
 The request read is bounded by `Server.max_request_head`, handles a request
 split across reads, and keeps bytes sent behind the head as the first frames.
@@ -163,7 +189,9 @@ split across reads, and keeps bytes sent behind the head as the first frames.
 When the peer's last messages and its Close arrive in one read, the Close is
 answered once those messages are delivered: replies to them are sent first,
 and the next `receive!` (or `poll!`, `receive_frame!`, `close!`) writes the
-echo and gives `Closed`. This holds for both roles.
+echo and gives `Closed`. This holds for both roles, and matches a push
+platform such as Workers, whose runtime delivers the messages before the
+close.
 
 ### The pure core
 
@@ -187,56 +215,102 @@ and `Ws.drive!` over a scripted link.
   has no extra headers.
 - A server waiting for the client's answer to its Close is bounded only
   through `poll!`, by the app.
+- The echo of the peer's Close is held while messages read with it wait to be
+  delivered (see above). An app that stops reading after the last message
+  (it never calls `receive!`, `poll!`, `receive_frame!` or `close!` again)
+  sends no echo, and the peer sees the stream end with no Close.
+- `max_message`: with none in `Ws.ConnectRequest` or `Ws.AcceptOptions`, the
+  limit is the adapter's, 16 MiB over bytes (`Client.default_max_message`,
+  `Server.default_max_message`). A longer message fails the connection with
+  1009: `Closed({ code: 1009, by: Us, clean: Bool.False, .. })`.
 - `DESIGN.md` has the design, the platform analysis and what is left.
 
 ## Tests
 
 ```sh
 ROC=/path/to/roc scripts/all_tests.sh   # fmt, check, expects, examples, tests/, docs
-ROC=/path/to/roc scripts/bundle.sh 0.0.4  # dist/<hash>.tar.zst and its release URL
+ROC=/path/to/roc scripts/bundle.sh 0.0.5  # dist/<hash>.tar.zst and its release URL
 ROC=/path/to/roc scripts/test_bundle.sh   # the examples and tests against the bundle
 ```
 
-129 `expect`s in `src/`: RFC 6455 vectors (the handshake key, the section 5.7
+133 `expect`s in `src/`: RFC 6455 vectors (the handshake key, the section 5.7
 frames, fragmentation, close codes), RFC 4648 Base64 vectors, SHA-1 vectors, and
 the protocol state machine. `tests/client.roc` runs the client over a scripted
-link (24 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
-handshake and `Closing`, generic code over a closed record, `messages`, `drive!`,
-`close_and_wait!`, refusals). `tests/server.roc` runs the server (47 checks: a
-request split across reads, the bounded read and 431, bad upgrades, refusals,
-the subprotocol choice, extensions declined, unmasked client frames failing
-with 1002, Ping and Pong, a close by either side, `drive!`), and a client and a
-server wired together in memory.
+link (28 checks: leftover bytes, a deadline inside a frame, `poll!`, the closing
+handshake and `Closing`, the held echo, `max_message`, generic code over a
+closed record, `messages`, `drive!`, `close_and_wait!`, refusals).
+`tests/server.roc` runs the server (64 checks: a request split across reads, the
+bounded read and 431, bad upgrades, refusals with any final status, the
+subprotocol choice in the server's order, extensions declined, unmasked client
+frames failing with 1002, Ping and Pong, a close by either side, the held echo,
+`drive!` with its state on every end), and a client and a server wired together
+in memory.
 
 ## Changes
 
-### Unreleased
+### 0.0.5
 
-Added, non-breaking:
+Breaking, with the migration:
 
-- `Server`: `Server.accept!`, `Server.read_request!`, `Server.Request(b, e)`
-  (`upgrade`, `accept!`, `refuse!`), `Server.Conn(b, e)`, `Server.ops`,
-  `Server.Ops`, `Server.Transport`, `Server.Errors`, `Server.Error`,
-  `Server.Refusal`, `Server.default_max_message`, `Server.max_request_head`.
-- `Handshake.refusal(status, headers, body)`, any refusal response
-  (`Handshake.rejection` is `refusal(status, [], why)`, and its output is
-  unchanged), with reason phrases for 401, 403, 404, 408, 429, 431, 500 and
-  503; `Handshake.head_end(bytes, from)`.
-- `Protocol.expects`, the masking a received frame must have.
+- `Ws.Handlers`: `on_close!` gets the connection, after the state as in
+  `on_open!` and `on_message!`:
+  `on_close! : s, c, Ws.Closure => Try(s, Ws.Error(e))`.
 
-- `Server.Request.map_link`, as `Conn.map_link`.
+  ```roc
+  # 0.0.4
+  on_close!: |state, closure| Ok(state),
+  # 0.0.5
+  on_close!: |state, _conn, closure| Ok(state),
+  ```
+- `Ws.drive!` returns the state with how the run ended,
+  `(s, Try(Ws.Closure, Ws.Error(e)))`, so an error no longer loses the state.
+  It is not a `Try`, so `drive!(...)?` no longer compiles:
 
-Changed, both roles:
+  ```roc
+  # 0.0.4
+  state2 = Ws.drive!(ops, conn, state, handlers)?
+  # 0.0.5
+  (state2, ended) = Ws.drive!(ops, conn, state, handlers)
+  closure = ended?
+  ```
 
-- The echo of the peer's Close waits until the messages read with it are
-  delivered, so a reply to one of them is sent (it gave `Closed` before). An
-  app that never calls `receive!` again after the last message sends no echo.
+  `Ok(closure)` comes after `on_close!`, whose state is `state2`; with
+  `Err(err)`, `state2` is the state of the last handler that succeeded (the
+  initial state when `on_open!` fails).
 - `Ws.drive!`: a handler that fails with `Closed` no longer ends the run; the
   messages left are delivered from the connection as it was before that
   call, and `on_close!` runs. Other handler errors end it as before.
+- The echo of the peer's Close waits until the messages read with it are
+  delivered, so a reply to one of them is sent (it gave `Closed` before). An
+  app that never reads again after the last message sends no echo. Both
+  roles.
 
-`Client.Conn` now holds the frame I/O that it shares with `Server.Conn`; its
-methods, types and behaviour are otherwise unchanged.
+Added:
+
+- `Server`: `Server.accept!`, `Server.read_request!`, `Server.Request(b, e)`
+  (`upgrade`, `accept!`, `refuse!`, `map_link`), `Server.Conn(b, e)`,
+  `Server.ops`, `Server.Ops`, `Server.Transport`, `Server.Errors`,
+  `Server.Error`, `Server.default_max_message`, `Server.max_request_head`.
+  The subprotocol is the first of `options.protocols` (the server's order of
+  preference) that the client offered. `refuse!` takes any final status,
+  200 to 599.
+- `Ws.Upgrade`, the request a server sees (`resource`, `host`, `protocols`,
+  `headers`), and `Ws.Refusal`, how it refuses (`status`, `headers`, `body`).
+  Shared by every server adapter; how a refusal is sent is the platform's.
+- `Handshake.refusal(status, headers, body)`, any refusal response
+  (`Handshake.rejection` is `refusal(status, [], why)`, and its output is
+  unchanged), with reason phrases for 200, 301, 302, 303, 307, 308, 401, 403,
+  404, 408, 429, 431, 500 and 503; `Handshake.head_end(bytes, from)`.
+- `Protocol.expects`, the masking a received frame must have.
+
+Changed, not breaking:
+
+- `Handshake.choose_protocol(upgrade, supported)` picks by the order of
+  `supported`, not of the client's offer.
+- `max_message` is documented on `Ws.ConnectRequest` and `Ws.AcceptOptions`.
+- `Client.Conn` now holds the frame I/O that it shares with `Server.Conn`; its
+  methods, types and behaviour are otherwise unchanged.
+- Pinned to Roc `nightly-2026-11-03-34bd006`.
 
 ### 0.0.4
 
