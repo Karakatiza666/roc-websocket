@@ -50,7 +50,10 @@ Ws :: [].{
 	## A request to open a client connection. `protocols` are the
 	## subprotocols offered in order (default none), `headers` extra request
 	## headers (default none), `max_message` the largest message accepted, in
-	## bytes; a bigger one fails the connection with 1009.
+	## bytes. With no `max_message` the adapter's own limit applies (16 MiB
+	## over bytes, `Client.default_max_message`). A bigger message fails the
+	## connection with 1009: `receive!` gives
+	## `Closed({ code: 1009, by: Us, clean: Bool.False, .. })`.
 	ConnectRequest : { url : Str, protocols ?: List(Str), headers ?: List((Str, Str)), max_message ?: U64 }
 
 	## An open connection `conn`, with what the handshake settled: the chosen
@@ -61,8 +64,25 @@ Ws :: [].{
 
 	## Options of a server accepting an upgrade: the subprotocols it supports,
 	## in order of preference (default none), and `max_message`, the largest
-	## message accepted, in bytes.
+	## message accepted, in bytes. The chosen subprotocol is the first of
+	## `protocols` that the client offered, whatever the order of its offer;
+	## none when nothing matches. With no `max_message` the adapter's own
+	## limit applies (16 MiB over bytes, `Server.default_max_message`). A
+	## bigger message fails the connection with 1009: `receive!` gives
+	## `Closed({ code: 1009, by: Us, clean: Bool.False, .. })`.
 	AcceptOptions : { protocols ?: List(Str), max_message ?: U64 }
+
+	## An upgrade request as a server sees it before it accepts or refuses:
+	## the resource (path and query), `Host`, the subprotocols the client
+	## offered in its order, and every header, its name lowercased.
+	Upgrade : { resource : Str, host : Str, protocols : List(Str), headers : List((Str, Str)) }
+
+	## How a server refuses an upgrade: a final HTTP status, 200 to 599 (RFC
+	## 6455 section 4.2.2 allows any status but 101), such as 401 with a
+	## `WWW-Authenticate` header or a 3xx with a `Location`; extra response
+	## headers (default none); a plain-text body (default none). How a refusal is sent is the platform's: a byte
+	## server writes it, a request handler returns it as its response.
+	Refusal : { status : U16, headers ?: List((Str, Str)), body ?: Str }
 
 	# ---------------------------------------------------------------- features
 
@@ -139,10 +159,15 @@ Ws :: [].{
 	## connection, used with the adapter's `Sender` fields. On a runtime that
 	## does not keep the server in memory between events, the adapter stores
 	## `s` (for example through `Persist`) or the application keeps `s` as `{}`.
+	##
+	## `on_close!` gets the connection too, after it has ended: for what the
+	## value holds (an adapter's link to close, a connection id to forget, a
+	## `Persist` attachment to read). Sending on it gives `Closed`. It returns
+	## no connection, since nothing follows it.
 	Handlers(s, c, e) : {
 		on_open! : s, c => Try((s, c), Ws.Error(e)),
 		on_message! : s, c, Ws.Message => Try((s, c), Ws.Error(e)),
-		on_close! : s, Ws.Closure => Try(s, Ws.Error(e)),
+		on_close! : s, c, Ws.Closure => Try(s, Ws.Error(e)),
 	}
 
 	# ------------------------------------------- what the pure core needs
@@ -217,17 +242,32 @@ Ws :: [].{
 	}
 
 	## Run push handlers over a pull connection until it closes: `on_open!`,
-	## `on_message!` for each message, then `on_close!`, whose state is the
-	## result.
+	## `on_message!` for each message, then `on_close!` with the connection
+	## as the last call left it and the closure.
+	##
+	## The result is the state and how the run ended, both ways: `(s,
+	## Ok(closure))` after `on_close!`, whose state it is, or `(s, Err(err))`
+	## with the state as the last handler that succeeded left it (the initial
+	## state when `on_open!` fails). So an error does not lose the state:
+	##
+	## ```roc
+	## (count, ended) = Ws.drive!(ops, conn, 0, handlers)
+	## save!(count)
+	## closure = ended?
+	## ```
 	##
 	## A handler that fails with `Closed` (it sent on a connection that had
 	## ended, such as one whose stream dropped with messages still to deliver)
 	## does not end the run: the messages left are delivered from the
 	## connection as it was before that call, then `on_close!` runs. Any other
-	## handler error ends the run with that error.
-	drive! : { receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c, s, Ws.Handlers(s, c, e) => Try(s, Ws.Error(e))
+	## handler error, or an error of `receive!` other than `Closed`, ends the
+	## run with that error and no `on_close!`.
+	drive! : { receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c, s, Ws.Handlers(s, c, e) => (s, Try(Ws.Closure, Ws.Error(e)))
 	drive! = |ops, conn, state, handlers| {
-		(s0, c0) = (handlers.on_open!)(state, conn)?
+		(s0, c0) = match (handlers.on_open!)(state, conn) {
+			Ok(opened) => opened
+			Err(err) => return (state, Err(err))
+		}
 		var $s = s0
 		var $c = c0
 		while Bool.True {
@@ -241,10 +281,14 @@ Ws :: [].{
 						Err(Closed(_)) => {
 							$c = next
 						}
-						Err(other) => return Err(other)
+						Err(other) => return ($s, Err(other))
 					}
-				Err(Closed(closure)) => return (handlers.on_close!)($s, closure)
-				Err(other) => return Err(other)
+				Err(Closed(closure)) =>
+					return match (handlers.on_close!)($s, $c, closure) {
+						Ok(closed) => (closed, Ok(closure))
+						Err(err) => ($s, Err(err))
+					}
+				Err(other) => return ($s, Err(other))
 			}
 		}
 	}

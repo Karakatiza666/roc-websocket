@@ -153,16 +153,41 @@ main! = |_args| {
 	handlers = {
 		on_open!: |s, c| Ok((s, c)),
 		on_message!: |s, c, m| Ok((s.append(m), c)),
-		on_close!: |s, closure| Ok(s.append(Text("closed ${closure.code.to_str()}"))),
+		on_close!: |s, _, closure| Ok(s.append(Text("closed ${closure.code.to_str()}"))),
 	}
-	seen = ok(Ws.drive!(ops, c13, [], handlers))
+	(seen, drive_end) = Ws.drive!(ops, c13, [], handlers)
 	c17 = open!([Data(response("")), Data(server(Frame.text("reply")))])
 	(c18, reply) = ok(exchange!({ send!: ops.send!, receive!: ops.receive! }, c17, Text("ask")))
 	check!("generic code typed with Ws.Error", reply == Text("reply") and sent(c18.link()) == [Frame.text("ask")])
 	c19 = open!([Data(response("")), Data(server(Frame.text("m1")).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
 	streamed = Stream.collect!(Ws.messages(ops, c19))
 	check!("messages ends with the closure", streamed == [Ok(Text("m1")), Err(Closed({ code: 1000, reason: "", clean: Bool.True, by: Peer }))])
-	check!("drive! threads the state", seen == [Text("a"), Text("b"), Text("closed 1000")])
+	check!("drive! threads the state", seen == [Text("a"), Text("b"), Text("closed 1000")] and ok(drive_end) == { code: 1000, reason: "", clean: Bool.True, by: Peer })
+
+	# The server's last messages and its Close in one read: the echo waits,
+	# so replies are sent, and on_close! gets the state and the connection.
+	h0 = open!([Data(response("")), Data(server(Frame.text("one")).concat(server(Frame.text("two"))).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
+	(h1, one) = ok(h0.receive!())
+	h2 = ok(h1.send!(one))
+	check!("held echo: a reply to a message read with the Close is sent", sent(h2.link()) == [Frame.text("one")])
+	echo_handlers = {
+		on_open!: |s, c| Ok((s, c)),
+		on_message!: |s, c, m| match c.send!(m) {
+			Ok(replied) => Ok(({ ..s, count: s.count + 1 }, replied))
+			Err(err) => Err(err)
+		},
+		on_close!: |s, c, closure| Ok({ ..s, replies: sent(c.link()), by: Str.inspect(closure.by) }),
+	}
+	(held, held_end) = Ws.drive!(ops, h0, { count: 0.U64, replies: [], by: "" }, echo_handlers)
+	check!("held echo: drive! replies to each message, then on_close!", held.count == 2 and held.replies == [Frame.text("one"), Frame.text("two")] and held.by == "Peer")
+	check!("held echo: drive! ends with the peer's clean close", ok(held_end) == { code: 1000, reason: "", clean: Bool.True, by: Peer })
+
+	# A message over max_message fails the connection with 1009, by us.
+	big = match Client.open!(fake_ops, { chunks: [Data(response("").concat(server(Frame.binary([1, 2, 3, 4]))))], written: [] }, { url: "ws://example.com/", max_message: 3 }) {
+		Ok(opened) => opened.conn
+		Err(e) => crash "open failed: ${Str.inspect(e)}"
+	}
+	check!("a message over max_message closes with 1009, by us, not clean", closed_with(big.receive!()) == Ok({ code: 1009, reason: "a message of more than 3 bytes", clean: Bool.False, by: Us }))
 	c14 = open!([Data(response("")), Data(server(Frame.text("dropped")).concat(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] })))])
 	check!("close_and_wait!", Ws.close_and_wait!(ops, c14, 1000, "") == Ok({ code: 1000, reason: "", clean: Bool.True, by: Us }))
 	c15 = open!([Data(response("")), Data(server({ fin: Bool.True, opcode: Close, payload: [0x03, 0xE8] }))])

@@ -368,14 +368,26 @@ main! = |_args| {
 
 	# The application looks at the request and refuses it.
 	pending = ok(Server.read_request!(fake_ops, fake([Data(request("Sec-WebSocket-Protocol: chat, superchat\r\n"))])))
-	check!("the request is readable before answering", pending.upgrade().resource == "/chat" and pending.upgrade().protocols == ["chat", "superchat"])
+	seen_upgrade : Ws.Upgrade
+	seen_upgrade = pending.upgrade()
+	check!("the request is readable before answering", seen_upgrade.resource == "/chat" and seen_upgrade.host == "example.com" and seen_upgrade.protocols == ["chat", "superchat"] and seen_upgrade.headers.contains(("sec-websocket-key", key)))
 	check!(
-		"a refusal status outside 400-599 is InvalidStatus",
-		match pending.refuse!({ status: 200 }) {
-			Err(InvalidStatus(200)) => Bool.True
+		"a refusal with 101 is InvalidStatus",
+		match pending.refuse!({ status: 101 }) {
+			Err(InvalidStatus(101)) => Bool.True
 			_ => Bool.False
 		},
 	)
+	check!(
+		"a refusal with another 1xx or no HTTP status is InvalidStatus",
+		match (pending.refuse!({ status: 100 }), pending.refuse!({ status: 600 })) {
+			(Err(InvalidStatus(100)), Err(InvalidStatus(600))) => Bool.True
+			_ => Bool.False
+		},
+	)
+	redirected = ok(pending.refuse!({ status: 302, headers: [("Location", "/login")] }))
+	check!("a 3xx refusal with a Location is written", first_written(redirected).starts_with("HTTP/1.1 302 Found\r\nLocation: /login\r\n"))
+	check!("a 401 refusal is written", first_written(ok(pending.refuse!({ status: 401, headers: [("WWW-Authenticate", "Bearer")] }))).starts_with("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\n"))
 	refused_link = ok(pending.refuse!({ status: 403, headers: [("X-Why", "test")], body: "no" }))
 	check!("a refusal writes its status, headers and body", refused_link.written == [Handshake.refusal(403, [("X-Why", "test")], "no").to_utf8()])
 	check!("a refusal starts with 403 Forbidden", first_written(refused_link).starts_with("HTTP/1.1 403 Forbidden\r\nX-Why: test\r\n"))
@@ -384,6 +396,8 @@ main! = |_args| {
 	offered = Data(request("Sec-WebSocket-Protocol: chat, superchat\r\n"))
 	chose = accept!([offered], { protocols: ["superchat", "other"] })
 	check!("the server chooses an offered subprotocol", chose.protocol == "superchat" and first_written(chose.conn.link()).contains("\r\nSec-WebSocket-Protocol: superchat\r\n"))
+	ordered = accept!([Data(request("Sec-WebSocket-Protocol: v2, chat\r\n"))], { protocols: ["chat", "v2"] })
+	check!("the server's order of preference decides, not the client's", ordered.protocol == "chat" and first_written(ordered.conn.link()).contains("\r\nSec-WebSocket-Protocol: chat\r\n"))
 	none = accept!([offered], { protocols: ["other"] })
 	check!("none in common: no subprotocol, still accepted", none.protocol == "" and !first_written(none.conn.link()).contains("Sec-WebSocket-Protocol"))
 	own = ok(Server.read_request!(fake_ops, fake([offered])))
@@ -439,7 +453,7 @@ main! = |_args| {
 			Ok(c2) => Ok((n + 1, c2))
 			Err(err) => Err(err)
 		},
-		on_close!: |n, _| Ok(n),
+		on_close!: |n, _, _| Ok(n),
 	}
 	# A message and then an unmasked frame in one read: the message is
 	# delivered, the connection has failed with 1002, so a reply is Closed;
@@ -453,10 +467,55 @@ main! = |_args| {
 			Ok(c2) => Ok((n, c2))
 			Err(err) => Err(err)
 		},
-		on_close!: |_, closure| Ok(closure.code),
+		on_close!: |_, _, closure| Ok(closure.code),
 	}
-	check!("Ws.drive! reaches on_close! after a handler's Closed", ok(Ws.drive!(Server.ops({}), failed!({}), 0.U16, codes_handlers)) == 1002)
-	check!("Ws.drive! echoes a message read with the Close and reaches on_close!", ok(Ws.drive!(Server.ops({}), d0, 0.U64, echo_handlers)) == 1)
+	(code, after_failed) = Ws.drive!(Server.ops({}), failed!({}), 0.U16, codes_handlers)
+	check!("Ws.drive! reaches on_close! after a handler's Closed", code == 1002 and ok(after_failed).code == 1002)
+	(echoed, echo_end) = Ws.drive!(Server.ops({}), d0, 0.U64, echo_handlers)
+	check!("Ws.drive! echoes a message read with the Close and reaches on_close!", echoed == 1 and ok(echo_end) == { code: 1000, reason: "", clean: Bool.True, by: Peer })
+
+	# Messages and the client's Close in one read, under Ws.drive!: every
+	# reply is sent, then on_close! gets the state and the connection.
+	held = conn!([Data(client(Frame.text("one")).concat(client(Frame.binary([2]))).concat(client(close_frame([0x03, 0xE8, 98, 121, 101]))))])
+	held_handlers = {
+		on_open!: |s, c| Ok((s, c)),
+		on_message!: |s, c, m| match c.send!(m) {
+			Ok(c2) => Ok(({ ..s, count: s.count + 1 }, c2))
+			Err(err) => Err(err)
+		},
+		on_close!: |s, c, closure| Ok({ ..s, replies: sent(c.link()), why: closure.reason }),
+	}
+	(held_state, held_end) = Ws.drive!(Server.ops({}), held, { count: 0.U64, replies: [], why: "" }, held_handlers)
+	check!("held echo: both replies are sent before on_close!", held_state.replies == [Frame.text("one"), Frame.binary([2])])
+	check!("held echo: on_close! runs with the state of every message", held_state.count == 2 and held_state.why == "bye")
+	check!("held echo: drive! ends with the peer's clean close", ok(held_end) == { code: 1000, reason: "bye", clean: Bool.True, by: Peer })
+
+	# drive! keeps the state when it ends with an error: a handler's error,
+	# and on_open!'s.
+	broken = conn!([Data(client(Frame.text("count")).concat(client(Frame.text("send"))))]).map_link(|f| { ..f, fail_writes: Bool.True })
+	broken_handlers = {
+		on_open!: |n, c| Ok((n + 10, c)),
+		on_message!: |n, c, m| match m {
+			Text("send") =>
+				match c.send!(m) {
+					Ok(c2) => Ok((n + 100, c2))
+					Err(err) => Err(err)
+				}
+			_ => Ok((n + 1, c))
+		},
+		on_close!: |n, _, _| Ok(n + 1000),
+	}
+	(kept, broken_end) = Ws.drive!(Server.ops({}), broken, 0.U64, broken_handlers)
+	check!(
+		"Ws.drive! gives the state with a handler's error",
+		match broken_end {
+			Err(Wrote(_)) => kept == 11
+			_ => Bool.False
+		},
+	)
+	refuse_open = { ..broken_handlers, on_open!: |_, _| Err(Closing) }
+	(initial, open_end) = Ws.drive!(Server.ops({}), broken, 7.U64, refuse_open)
+	check!("Ws.drive! gives the initial state when on_open! fails", initial == 7 and is_closing(open_end))
 
 	# The server closes: Closing meanwhile, a message on its way, then the echo.
 	s1 = conn!([Data(client(Frame.text("in flight"))), Data(client(close_frame([0x03, 0xE9])))])
@@ -474,10 +533,10 @@ main! = |_args| {
 	# max_message from the options.
 	big = accept!([Data(request("").concat(client(Frame.binary([1, 2, 3, 4]))))], { max_message: 3 }).conn
 	check!(
-		"a message over max_message fails with 1009",
-		match big.receive!() {
-			Err(Closed({ code: 1009, .. })) => Bool.True
-			_ => Bool.False
+		"a message over max_message fails with 1009, by us, not clean",
+		match closed_with(big.receive!()) {
+			Ok(closure) => closure.code == 1009 and closure.by == Us and !closure.clean
+			Err(_) => Bool.False
 		},
 	)
 
@@ -495,9 +554,10 @@ main! = |_args| {
 			Text(t) => Ok((seen.append(t), c))
 			Binary(_) => Ok((seen, c))
 		},
-		on_close!: |seen, closure| Ok(seen.append("closed ${closure.code.to_str()} by ${Str.inspect(closure.by)}")),
+		on_close!: |seen, _, closure| Ok(seen.append("closed ${closure.code.to_str()} by ${Str.inspect(closure.by)}")),
 	}
-	check!("Ws.drive! runs handlers over a server connection", ok(Ws.drive!(ops, d1, [], handlers)) == ["open", "one", "quit", "closed 4000 by Us"])
+	(d1_seen, d1_end) = Ws.drive!(ops, d1, [], handlers)
+	check!("Ws.drive! runs handlers over a server connection", d1_seen == ["open", "one", "quit", "closed 4000 by Us"] and ok(d1_end).by == Us)
 
 	client_closes!({})
 	server_closes!({})

@@ -44,17 +44,19 @@ main! = |_args| {
 			Ok(sent) => Ok((count + 1, sent))
 			Err(err) => Err(err)
 		},
-		on_close!: |count, closure| {
-			echo!("closed with ${closure.code.to_str()} by ${Str.inspect(closure.by)} after ${count.to_str()} messages\n")
+		on_close!: |count, conn, closure| {
+			echo!("closed with ${closure.code.to_str()} by ${Str.inspect(closure.by)} after ${count.to_str()} messages, ${conn.link().written.len().to_str()} writes\n")
 			Ok(count)
 		},
 	}
-	match Ws.drive!(ops, opened.conn, 0.U64, handlers) {
-		Ok(_) => {}
-		Err(err) => crash "drive! failed: ${Str.inspect(err)}"
+	# drive! gives the state whether the run ended cleanly or with an error.
+	(count, ended) = Ws.drive!(ops, opened.conn, 0.U64, handlers)
+	match ended {
+		Ok(closure) => echo!("drive! ended with ${closure.code.to_str()} after ${count.to_str()} messages\n")
+		Err(err) => crash "drive! failed after ${count.to_str()} messages: ${Str.inspect(err)}"
 	}
 
-	# What the server wrote: the 101, then the echoes, unmasked.
+	# What the server wrote first: the 101.
 	echo!(Str.from_utf8(opened.conn.link().written.first() ?? []) ?? "")
 	Ok({})
 }

@@ -21,8 +21,9 @@ Server :: [].{
 
 	## The tags the server adds to the platform's row `e`: `NotUpgrade(why)`
 	## for a request that is not a valid upgrade (answered with a refusal
-	## already), `InvalidStatus(status)` for a refusal status outside
-	## 400-599, and the frame tags of `Client.Errors`.
+	## already), `InvalidStatus(status)` for a refusal status that is not a
+	## final HTTP status (200-599, so never 101), and the frame tags of
+	## `Client.Errors`.
 	Errors(e) : [NotUpgrade(Str), InvalidStatus(U16), InvalidClose(Str), ControlTooLong(U64), BadFrame(Str), ..e]
 
 	## Every error of a server call: `Closed`, `Closing` and `Server.Errors(e)`.
@@ -35,10 +36,6 @@ Server :: [].{
 	## The operations of a server connection as a record, for code generic
 	## over features: the core, ping, pong, frames and poll.
 	Ops(b, e) : Ws.Core(Server.Conn(b, e), Server.Errors(e), Ws.Ping(Server.Conn(b, e), Server.Errors(e), Ws.Pong(Server.Conn(b, e), Server.Errors(e), Ws.Frames(Server.Conn(b, e), Server.Errors(e), Ws.Poll(Server.Conn(b, e), Server.Errors(e), {})))))
-
-	## How an application refuses an upgrade: a status from 400 to 599, extra
-	## response headers (default none) and a plain-text body (default none).
-	Refusal : { status : U16, headers ?: List(Handshake.Header), body ?: Str }
 
 	## An open server connection over the link value `b`, from
 	## `Server.accept!` or `request.accept!`.
@@ -131,13 +128,17 @@ Server :: [].{
 		map_link = |request, change| { ..request, link: change(request.link) }
 
 		## The request: its resource, `Host`, the subprotocols the client
-		## offered in order, and every header.
-		upgrade : Server.Request(b, e) -> Handshake.Upgrade
-		upgrade = |request| request.upgrade
+		## offered in order, and every header (names lowercased).
+		upgrade : Server.Request(b, e) -> Ws.Upgrade
+		upgrade = |request| {
+			u = request.upgrade
+			{ resource: u.resource, host: u.host, protocols: u.protocols, headers: u.headers }
+		}
 
 		## Accept the upgrade: write the 101 response with the first
-		## subprotocol of the client's offer that is in `options.protocols`
-		## (none when nothing matches), and return the connection. No
+		## subprotocol of `options.protocols` that the client offered (the
+		## server's order of preference; none when nothing matches), and
+		## return the connection. No
 		## extension is accepted, so `extensions` is `Reported([])`. Bytes the
 		## client sent after its request are then read as frames.
 		##
@@ -160,15 +161,18 @@ Server :: [].{
 
 		## Refuse the upgrade: write a response with `refusal.status`, its
 		## headers and body, and give the link back for the adapter to close.
-		## A status outside 400-599 is `InvalidStatus` and writes nothing.
+		## Any final status is allowed (a 3xx with a `Location` header, a 401
+		## with `WWW-Authenticate`, a 4xx or 5xx). A status outside 200-599
+		## (a 1xx, 101 among them, which ends no exchange, or no HTTP status)
+		## is `InvalidStatus` and writes nothing.
 		##
 		## ```roc
 		## link = request.refuse!({ status: 403, body: "no access to ${request.upgrade().resource}" })?
 		## ```
-		refuse! : Server.Request(b, e), Server.Refusal => Try(b, Server.Error(e))
+		refuse! : Server.Request(b, e), Ws.Refusal => Try(b, Server.Error(e))
 		refuse! = |request, refusal| {
 			status = refusal.status
-			if status < 400 or status > 599 {
+			if status < 200 or status > 599 {
 				return Err(InvalidStatus(status))
 			}
 			response = Handshake.refusal(status, refusal.?headers ?? [], refusal.?body ?? "")

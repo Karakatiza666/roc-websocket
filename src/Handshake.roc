@@ -220,10 +220,10 @@ Handshake :: [].{
 		Ok("${Str.join_with(lines, "\r\n")}\r\n\r\n")
 	}
 
-	## The first protocol of the client's offer that the server supports, or
-	## `""`.
+	## The first protocol of `supported`, the server's order of preference,
+	## that the client offered, or `""`.
 	choose_protocol : Handshake.Upgrade, List(Str) -> Str
-	choose_protocol = |upgrade, supported| upgrade.protocols.find_first(|p| supported.contains(p)) ?? ""
+	choose_protocol = |upgrade, supported| supported.find_first(|p| upgrade.protocols.contains(p)) ?? ""
 
 	## A refusal of an upgrade: the status, `Sec-WebSocket-Version: 13` for a
 	## 426, and `why` as the body.
@@ -236,6 +236,12 @@ Handshake :: [].{
 	refusal : U16, List(Handshake.Header), Str -> Str
 	refusal = |status, headers, body| {
 		reason = match status {
+			200 => "OK"
+			301 => "Moved Permanently"
+			302 => "Found"
+			303 => "See Other"
+			307 => "Temporary Redirect"
+			308 => "Permanent Redirect"
 			400 => "Bad Request"
 			401 => "Unauthorized"
 			403 => "Forbidden"
@@ -247,6 +253,7 @@ Handshake :: [].{
 			431 => "Request Header Fields Too Large"
 			500 => "Internal Server Error"
 			503 => "Service Unavailable"
+			_ if status < 400 => ""
 			_ => "Error"
 		}
 		version = if (status == 426) ["Sec-WebSocket-Version: 13"] else []
@@ -363,6 +370,12 @@ expect
 		Ok(u) => Handshake.accept_response(u, "chat", []) == Ok(rfc_response)
 		Err(_) => Bool.False
 	}
+# The server's order of preference decides, not the client's.
+expect
+	match Handshake.parse_upgrade(rfc_request.replace_first("chat, superchat", "v2, chat")) {
+		Ok(u) => Handshake.choose_protocol(u, ["chat", "v2"]) == "chat" and Handshake.choose_protocol(u, ["v2", "chat"]) == "v2" and Handshake.choose_protocol(u, ["other"]) == ""
+		Err(_) => Bool.False
+	}
 expect Handshake.parse_upgrade(rfc_request.replace_first("Version: 13", "Version: 8")) == Err(Rejected({ status: 426, why: "Sec-WebSocket-Version is not 13" }))
 expect Handshake.parse_upgrade(rfc_request.replace_first("GET", "POST")) == Err(Rejected({ status: 405, why: "the method is POST, not GET" }))
 expect Handshake.parse_upgrade(rfc_request.replace_first("dGhlIHNhbXBsZSBub25jZQ==", "c2hvcnQ=")) == Err(Rejected({ status: 400, why: "Sec-WebSocket-Key is not 16 bytes of Base64" }))
@@ -385,3 +398,6 @@ expect Handshake.head_end("ab\r\n\r\ncd".to_utf8(), 3) == Err(NotFound)
 expect Handshake.head_end("ab\r\n".to_utf8(), 0) == Err(NotFound)
 expect Handshake.rejection(426, "v") == "HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 1\r\nConnection: close\r\n\r\nv"
 expect Handshake.refusal(401, [("WWW-Authenticate", "Bearer")], "") == "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+expect Handshake.refusal(302, [("Location", "/login")], "").starts_with("HTTP/1.1 302 Found\r\nLocation: /login\r\n")
+expect Handshake.refusal(299, [], "").starts_with("HTTP/1.1 299 \r\n")
+expect Handshake.refusal(499, [], "").starts_with("HTTP/1.1 499 Error\r\n")
