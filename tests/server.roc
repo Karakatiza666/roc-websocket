@@ -419,9 +419,44 @@ main! = |_args| {
 	check!("a close by the client ends by the peer", closed_with(k1.receive!()) == Ok({ code: 1000, reason: "bye", clean: Bool.True, by: Peer }))
 	check!("and the server echoes the code, unmasked", wrote_frame(k1.map_link(|f| { ..f, fail_writes: Bool.True }).receive!()) == Ok(close_frame([0x03, 0xE8])))
 	# A message in the same read as the client's Close is delivered, but the
-	# Close is answered already, so a reply is Closed.
-	(e1, last) = ok(conn!([Data(client(Frame.text("last")).concat(client(close_frame([0x03, 0xE8]))))]).receive!())
-	check!("a message read with the client's Close is delivered; a reply is Closed", last == Text("last") and closed_with(e1.send!(Text("late"))) == Ok({ code: 1000, reason: "", clean: Bool.True, by: Peer }))
+	# Messages read with the client's Close: the echo waits until they are
+	# delivered, so replies to them go out first.
+	e0 = conn!([Data(client(Frame.text("one")).concat(client(Frame.text("two"))).concat(client(close_frame([0x03, 0xE8]))))])
+	check!("the echo is held while messages read with the Close wait", sent(e0.link()) == [])
+	(e1, first) = ok(e0.receive!())
+	e2 = ok(e1.send!(first))
+	(e3, second) = ok(e2.receive!())
+	e4 = ok(e3.send!(second))
+	check!("messages read with the client's Close are delivered, and replies to them are sent", first == Text("one") and second == Text("two") and sent(e4.link()) == [Frame.text("one"), Frame.text("two")])
+	check!("then the next receive! echoes the Close and ends by the peer", closed_with(e4.receive!()) == Ok({ code: 1000, reason: "", clean: Bool.True, by: Peer }))
+	check!("the echo is written after the replies", wrote_frame(e4.map_link(|f| { ..f, fail_writes: Bool.True }).receive!()) == Ok(close_frame([0x03, 0xE8])))
+	(e5, _) = ok(conn!([Data(client(Frame.text("one")).concat(client(close_frame([0x03, 0xE8]))))]).receive!())
+	check!("close! while the echo is held writes the echo", sent(ok(e5.close!(1000, "")).link()) == [close_frame([0x03, 0xE8])])
+	d0 = conn!([Data(client(Frame.text("a")).concat(client(close_frame([0x03, 0xE8]))))])
+	echo_handlers = {
+		on_open!: |n, c| Ok((n, c)),
+		on_message!: |n, c, m| match c.send!(m) {
+			Ok(c2) => Ok((n + 1, c2))
+			Err(err) => Err(err)
+		},
+		on_close!: |n, _| Ok(n),
+	}
+	# A message and then an unmasked frame in one read: the message is
+	# delivered, the connection has failed with 1002, so a reply is Closed;
+	# drive! still reaches on_close! with that closure.
+	failed! = |{}| conn!([Data(client(Frame.text("a")).concat(Frame.encode(Frame.text("b"), Unmasked) ?? []))])
+	(x1, _) = ok(failed!({}).receive!())
+	check!("a reply after the connection failed is Closed", closed_with(x1.send!(Text("a"))) == Ok({ code: 1002, reason: "a client frame is not masked", clean: Bool.False, by: Us }))
+	codes_handlers = {
+		on_open!: |n, c| Ok((n, c)),
+		on_message!: |n, c, m| match c.send!(m) {
+			Ok(c2) => Ok((n, c2))
+			Err(err) => Err(err)
+		},
+		on_close!: |_, closure| Ok(closure.code),
+	}
+	check!("Ws.drive! reaches on_close! after a handler's Closed", ok(Ws.drive!(Server.ops({}), failed!({}), 0.U16, codes_handlers)) == 1002)
+	check!("Ws.drive! echoes a message read with the Close and reaches on_close!", ok(Ws.drive!(Server.ops({}), d0, 0.U64, echo_handlers)) == 1)
 
 	# The server closes: Closing meanwhile, a message on its way, then the echo.
 	s1 = conn!([Data(client(Frame.text("in flight"))), Data(client(close_frame([0x03, 0xE9])))])
@@ -431,6 +466,9 @@ main! = |_args| {
 	(s3, late) = ok(s2.receive!())
 	check!("a message after close!", late == Text("in flight"))
 	check!("a close by the server ends by us", closed_with(s3.receive!()) == Ok({ code: 1001, reason: "", clean: Bool.True, by: Us }))
+	r0 = ok(Server.read_request!(fake_ops, fake([Data(request(""))])))
+	r1 = r0.map_link(|f| { ..f, written: [[42]] })
+	check!("Request.map_link changes the link the connection gets", (ok(r1.accept!({})).conn.link().written.first() ?? []) == [42])
 	check!("close_and_wait! over Server.ops", Ws.close_and_wait!(Server.ops({}), conn!([Data(client(close_frame([0x03, 0xE8])))]), 1000, "") == Ok({ code: 1000, reason: "", clean: Bool.True, by: Us }))
 
 	# max_message from the options.

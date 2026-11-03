@@ -9,12 +9,18 @@ import Protocol
 ## The roles differ only in `mask!` (a client masks each frame it sends with 4
 ## random bytes, a server does not mask) and in the `Protocol`'s role, which
 ## sets the masking a received frame must have.
+##
+## The peer's Close is answered once the messages read with it are delivered:
+## when one read brings messages and the Close, the echo is held (`held`)
+## until a call finds the inbox empty, so replies to those messages are sent
+## before it (RFC 6455 section 5.5.1 lets an endpoint delay its echo).
 Session(b, e) :: {
 	bytes : Ws.Bytes(b, Session.Errors(e), {}),
 	mask! : b => Try((b, Frame.Masking), Ws.Error(Session.Errors(e))),
 	link : b,
 	protocol : Protocol,
 	inbox : List(Ws.Message),
+	held : List(Frame),
 }.{
 
 	## The tags frame I/O adds to the row `e` of its role.
@@ -28,7 +34,7 @@ Session(b, e) :: {
 	## Pong, a Close) are written.
 	start! : Ws.Bytes(b, Session.Errors(e), {}), (b => Try((b, Frame.Masking), Session.Error(e))), b, Protocol, List(U8) => Try(Session(b, e), Session.Error(e))
 	start! = |bytes, mask!, link, protocol, rest| {
-		session = { bytes: bytes, mask!: mask!, link: link, protocol: protocol, inbox: [] }
+		session = { bytes: bytes, mask!: mask!, link: link, protocol: protocol, inbox: [], held: [] }
 		apply_events!(session, protocol.receive(rest))
 	}
 
@@ -54,7 +60,7 @@ Session(b, e) :: {
 
 	receive! : Session(b, e) => Try((Session(b, e), Ws.Message), Session.Error(e))
 	receive! = |s| {
-		var $s = s
+		var $s = release!(s)?
 		while Bool.True {
 			match next_ready($s) {
 				Ok((ready, m)) => return Ok((ready, m))
@@ -68,7 +74,7 @@ Session(b, e) :: {
 
 	poll! : Session(b, e) => Try((Session(b, e), [Message(Ws.Message), TimedOut]), Session.Error(e))
 	poll! = |s| {
-		var $s = s
+		var $s = release!(s)?
 		while Bool.True {
 			match next_ready($s) {
 				Ok((ready, m)) => return Ok((ready, Message(m)))
@@ -85,6 +91,10 @@ Session(b, e) :: {
 
 	close! : Session(b, e), U16, Str => Try(Session(b, e), Session.Error(e))
 	close! = |s, code, reason| {
+		if !s.held.is_empty() {
+			# The peer has closed: the held echo is the answer.
+			return write_held!(s)
+		}
 		usable(s)?
 		match s.protocol.close(code, reason) {
 			Ok((protocol, frame)) => write_frame!({ ..s, protocol }, frame)
@@ -114,7 +124,7 @@ Session(b, e) :: {
 
 	receive_frame! : Session(b, e) => Try((Session(b, e), Frame), Session.Error(e))
 	receive_frame! = |s| {
-		var $s = s
+		var $s = release!(s)?
 		while Bool.True {
 			match $s.protocol.closure() {
 				Ok(closure) => return Err(Closed(closure))
@@ -163,8 +173,9 @@ read_size : U64
 read_size = 65536
 
 ## Fail when the connection has ended or this endpoint already sent Close.
+## While the echo of the peer's Close is held, sending is still allowed.
 usable : Session(b, e) -> Try({}, Session.Error(e))
-usable = |s| match s.protocol.closure() {
+usable = |s| if (!s.held.is_empty()) Ok({}) else match s.protocol.closure() {
 	Ok(closure) => Err(Closed(closure))
 	Err(NotDone) =>
 		match s.protocol.closing() {
@@ -199,15 +210,23 @@ step! = |s| {
 	}
 }
 
-## Write the frames the protocol asked for and keep its messages.
+## Write the frames the protocol asked for and keep its messages. The echo
+## of the peer's Close is held while messages wait in the inbox.
 apply_events! : Session(b, e), (Protocol, List(Protocol.Event)) => Try(Session(b, e), Session.Error(e))
 apply_events! = |s, (protocol, events)| {
 	var $s = { ..s, protocol }
+	by_peer = match protocol.closure() {
+		Ok(c) => c.by == Peer
+		Err(NotDone) => Bool.False
+	}
 	for event in events {
 		match event {
-			Write(frame) => {
-				$s = write_frame!($s, frame)?
-			}
+			Write(frame) =>
+				if by_peer and frame.opcode == Close and !$s.inbox.is_empty() {
+					$s = { ..$s, held: $s.held.append(frame) }
+				} else {
+					$s = write_frame!($s, frame)?
+				}
 			Message(m) => {
 				$s = { ..$s, inbox: $s.inbox.append(m) }
 			}
@@ -215,6 +234,20 @@ apply_events! = |s, (protocol, events)| {
 			Ping(_) => {}
 			Pong(_) => {}
 		}
+	}
+	Ok($s)
+}
+
+## Write the held echo once the inbox is empty.
+release! : Session(b, e) => Try(Session(b, e), Session.Error(e))
+release! = |s| if (s.held.is_empty() or !s.inbox.is_empty()) Ok(s) else write_held!(s)
+
+## Write the held echo now.
+write_held! : Session(b, e) => Try(Session(b, e), Session.Error(e))
+write_held! = |s| {
+	var $s = { ..s, held: [] }
+	for frame in s.held {
+		$s = write_frame!($s, frame)?
 	}
 	Ok($s)
 }

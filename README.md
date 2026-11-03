@@ -139,7 +139,10 @@ _ = Ws.drive!(Server.ops({}), opened.conn, state, handlers)?
   `request.upgrade()` gives its resource, `Host`, offered subprotocols and
   headers (`Handshake.Upgrade`); then `request.accept!(options)`, or
   `request.refuse!({ status: 403, headers: [...], body: "..." }) : Try(b, ...)`,
-  which writes the refusal and gives the link back.
+  which writes the refusal and gives the link back. `request.map_link(change)`
+  changes the link before either, so an adapter can read the request with a
+  short handshake deadline and hand out a request whose connection reads with
+  its normal one.
 - `Server.Conn(b, e)` has the methods of `Client.Conn` (`send!`, `receive!`,
   `poll!`, `close!`, `ping!`, `pong!`, `send_frame!`, `receive_frame!`,
   `link`, `map_link`); `Server.ops({})` is the record (`Server.Ops(b, e)`).
@@ -156,6 +159,11 @@ The request read is bounded by `Server.max_request_head`, handles a request
 split across reads, and keeps bytes sent behind the head as the first frames.
 `close!` starts the closing handshake as in the client; once `receive!` gives
 `Closed`, the adapter closes the stream (`conn.link()`).
+
+When the peer's last messages and its Close arrive in one read, the Close is
+answered once those messages are delivered: replies to them are sent first,
+and the next `receive!` (or `poll!`, `receive_frame!`, `close!`) writes the
+echo and gives `Closed`. This holds for both roles.
 
 ### The pure core
 
@@ -216,8 +224,19 @@ Added, non-breaking:
   503; `Handshake.head_end(bytes, from)`.
 - `Protocol.expects`, the masking a received frame must have.
 
+- `Server.Request.map_link`, as `Conn.map_link`.
+
+Changed, both roles:
+
+- The echo of the peer's Close waits until the messages read with it are
+  delivered, so a reply to one of them is sent (it gave `Closed` before). An
+  app that never calls `receive!` again after the last message sends no echo.
+- `Ws.drive!`: a handler that fails with `Closed` no longer ends the run; the
+  messages left are delivered from the connection as it was before that
+  call, and `on_close!` runs. Other handler errors end it as before.
+
 `Client.Conn` now holds the frame I/O that it shares with `Server.Conn`; its
-methods, types and behaviour are unchanged.
+methods, types and behaviour are otherwise unchanged.
 
 ### 0.0.4
 

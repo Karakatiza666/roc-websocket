@@ -124,6 +124,12 @@ Server :: [].{
 	## after the request head, the start of its first frames.
 	Request(b, e) :: { transport : Server.Transport(b, e), link : b, upgrade : Handshake.Upgrade, rest : List(U8) }.{
 
+		## The same request with its link value changed by `change`, for an
+		## adapter that reads the request with one deadline and runs the
+		## connection with another (a short handshake timeout, for example).
+		map_link : Server.Request(b, e), (b -> b) -> Server.Request(b, e)
+		map_link = |request, change| { ..request, link: change(request.link) }
+
 		## The request: its resource, `Host`, the subprotocols the client
 		## offered in order, and every header.
 		upgrade : Server.Request(b, e) -> Handshake.Upgrade

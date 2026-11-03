@@ -219,6 +219,12 @@ Ws :: [].{
 	## Run push handlers over a pull connection until it closes: `on_open!`,
 	## `on_message!` for each message, then `on_close!`, whose state is the
 	## result.
+	##
+	## A handler that fails with `Closed` (it sent on a connection that had
+	## ended, such as one whose stream dropped with messages still to deliver)
+	## does not end the run: the messages left are delivered from the
+	## connection as it was before that call, then `on_close!` runs. Any other
+	## handler error ends the run with that error.
 	drive! : { receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c, s, Ws.Handlers(s, c, e) => Try(s, Ws.Error(e))
 	drive! = |ops, conn, state, handlers| {
 		(s0, c0) = (handlers.on_open!)(state, conn)?
@@ -226,11 +232,17 @@ Ws :: [].{
 		var $c = c0
 		while Bool.True {
 			match (ops.receive!)($c) {
-				Ok((next, m)) => {
-					(s1, c1) = (handlers.on_message!)($s, next, m)?
-					$s = s1
-					$c = c1
-				}
+				Ok((next, m)) =>
+					match (handlers.on_message!)($s, next, m) {
+						Ok((s1, c1)) => {
+							$s = s1
+							$c = c1
+						}
+						Err(Closed(_)) => {
+							$c = next
+						}
+						Err(other) => return Err(other)
+					}
 				Err(Closed(closure)) => return (handlers.on_close!)($s, closure)
 				Err(other) => return Err(other)
 			}

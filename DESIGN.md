@@ -447,13 +447,28 @@ the client.
   gives up after its own limit.
 - **The client starts it**: the `Protocol` echoes the code, `receive!` gives
   `Closed({ by: Peer, clean: True, .. })`, and the adapter closes the stream.
-- **Messages read with the client's Close**: a read is processed whole, so
-  when the client's last messages and its Close arrive in one read, the Close
-  is echoed at once. The messages are still delivered by `receive!`, but a
-  reply gives `Closed` (RFC 6455 section 5.5.1 lets an endpoint delay its echo
-  to finish sending; this one does not). The same holds for the client, and
-  `tests/server.roc` pins it. Delaying the echo until the inbox is empty
-  would be a change to the shared `Session`, for both roles.
+- **Messages read with the client's Close** (changed on `server-revisions`):
+  when the peer's last messages and its Close arrive in one read, `Session`
+  holds the echo until those messages are delivered. Sending stays allowed
+  while it is held, so replies to them go out before the echo; the next
+  `receive!`, `poll!`, `receive_frame!` or `close!` that finds the inbox empty
+  writes it. RFC 6455 section 5.5.1 lets an endpoint delay its echo. Before,
+  the echo went out at once and every reply gave `Closed`: an echo server
+  over `Ws.drive!` lost those replies, and `drive!` ended with that error, so
+  `on_close!` never ran and the application state was lost
+  (roc-basic-cli-websocket's `serve!` showed it with a client that sends and
+  closes in one write). It also matches a push platform, where the runtime
+  delivers the messages before the close event and replies to them succeed.
+  A Close that comes with no message before it is still echoed at once, and
+  a Close of a failed connection (by `Us`) is never held.
+- **`Ws.drive!` and a handler's `Closed`**: a handler that fails with
+  `Closed` sent on a connection that had already ended (a protocol failure
+  read with its message, for example). `drive!` then reads on from the
+  connection it gave the handler, which delivers the messages left and the
+  closure, and calls `on_close!`; other handler errors end the run.
+- **`Server.Request.map_link`**: an adapter reads the request with a short
+  handshake deadline and restores the connection's read timeout before it
+  hands out the request, so a request needs no adapter wrapper.
 
 #### Push handlers
 
