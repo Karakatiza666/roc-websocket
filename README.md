@@ -118,8 +118,8 @@ adds (`InvalidClose(Str)`, `ControlTooLong(U64)`, `BadFrame(Str)`,
 | `Sender(c, e, r)` | `send!`, `close!`, for push-model servers |
 | `Ping(c, e, r)`, `Pong(c, e, r)` | `ping!`, `pong!` (payload at most 125 bytes) |
 | `Frames(c, e, r)` | `send_frame!`, `receive_frame!` |
-| `ReceiveWithin(c, e, r)` | `receive_within!(conn, ms)`, `TimedOut` loses nothing |
-| `Poll(c, e, r)` | `poll!`, `TimedOut` when the platform's own read deadline passed |
+| `ReceiveWithin(c, e, r)` | `receive_within!(conn, ms)`: `TimedOut` when `ms` ms have passed since the call, whatever arrives meanwhile (Ping, Pong and partial frames do not extend it); an adapter that cannot bound the whole call leaves the field out; `TimedOut` loses nothing |
+| `Poll(c, e, r)` | `poll!`, an idle deadline: `TimedOut` only when one read passes the platform's read deadline with no bytes; any frame, a Ping included, restarts it, so it cannot build a deadline for data messages |
 | `Buffered(c, e, r)` | `buffered_amount!` |
 | `AutoResponse(c, e, r)` | a fixed text reply the runtime sends by itself; `c` is its scope (a connection or a whole server) |
 | `Persist(c, e, r)` | per-connection state that survives the server leaving memory |
@@ -248,6 +248,25 @@ in memory.
 
 ## Changes
 
+### Unreleased
+
+Documentation only, no type changes. The meaning of the two deadline features
+is now stated exactly:
+
+- `Ws.ReceiveWithin`: `receive_within!(c, ms)` is a total deadline. It gives
+  `TimedOut` when `ms` milliseconds have passed since the call, whatever
+  arrives meanwhile; Ping, Pong and partial frames do not extend it. An adapter
+  that cannot bound the whole call leaves the field out.
+- `Ws.Poll`: `poll!` is an idle deadline. It gives `TimedOut` only when one
+  read passes the platform's read deadline with no bytes. Any frame, a Ping
+  included, restarts it, so it cannot be used to build a deadline for data
+  messages. An adapter that implements `receive_within!` as `map_link`, then
+  `poll!`, then `map_link` must keep the total deadline in the link and answer
+  `TimedOut` from `read_up_to!` itself once it has passed.
+- `tests/client.roc` checks that composition over a link whose peer sends a
+  Ping per read, with a counter as the clock (the package has no clock). The
+  real-time test is in roc-basic-cli-websocket's e2e suite.
+
 ### 0.0.5
 
 Breaking, with the migration:
@@ -318,8 +337,8 @@ Added, non-breaking: `Client.Conn.map_link : Conn(b, e), (b -> b) -> Conn(b, e)`
 `Conn` is opaque, so an adapter could not change its link; `map_link` applies a
 function to the link value and keeps the protocol state (bytes read past a
 frame, a half-received message, a pending close). An adapter whose stream has a
-per-call read timeout can set it, then call `poll!`, which implements
-`Ws.ReceiveWithin` exactly.
+per-call read timeout can set it, then call `poll!`. (That bounds each read,
+not the call: see Unreleased, which says how to make the deadline total.)
 
 ### 0.0.3
 

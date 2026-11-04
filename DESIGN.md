@@ -139,9 +139,9 @@ Naming: a module's `Errors` is its row `e`, its `Error` the whole union
 ### 0.5 Features (changes 3.3; generic, not shaped by one platform)
 
 Each alias describes a feature as it appears on any platform that has it:
-`Core`, `Sender`, `Ping`, `Pong`, `Frames`, `ReceiveWithin` (a deadline the
-application picks), `Poll` (a receive bounded by the platform's own read
-deadline, which is what basic-webserver can do exactly), `Buffered`,
+`Core`, `Sender`, `Ping`, `Pong`, `Frames`, `ReceiveWithin` (a total deadline the
+application picks, since the call), `Poll` (an idle deadline: the platform's own
+read deadline, which any frame restarts), `Buffered`,
 `AutoResponse` (a fixed text reply the runtime sends by itself), `Persist`
 (per-connection state that survives the server leaving memory), `Topics`
 (publish/subscribe groups), `Connect` (`Dial` before 0.0.3), `Accept`, `Handlers`, and the inputs `Bytes`
@@ -242,6 +242,25 @@ shared types asked for something a platform in general cannot give:
 - **`Ws.messages` ends with the closure**: its last item is
   `Err(Closed(closure))`, the error that ended it, as for any other error.
   It used to end with no item, so the closure was lost.
+
+### 0.11b Deadline semantics (after 0.0.5, documentation only)
+
+- **`Ws.ReceiveWithin`**: `receive_within!(c, ms)` gives `TimedOut` when `ms`
+  milliseconds have passed since the call. The deadline bounds the whole
+  call: Ping, Pong and partial frames do not extend it. An adapter that
+  cannot bound the whole call leaves the field out. `TimedOut` loses nothing.
+- **`Ws.Poll`**: an idle deadline. `TimedOut` only when one read passes the
+  platform's read deadline with no bytes. Any frame, a Ping included,
+  restarts it, so it cannot be used to build a deadline for data messages.
+- The 0.0.4 note below ("`map_link` (set the timeout), then `poll!`") only
+  bounds each read. Because `Session.poll!` loops over reads and a Ping counts
+  as progress, a peer pinging every second keeps `receive_within!(conn, 3000)`
+  waiting for ever. A total deadline lives in the link: `read_up_to!` computes
+  the time left and gives `TimedOut` itself when none is left.
+- **Test.** The package has no clock, so `tests/client.roc` uses a link whose
+  reads return a Ping each and advance a counter, with the deadline kept in
+  the link as an adapter would. The real-clock test is in basic-cli's e2e
+  suite.
 
 ### 0.12 Changes in 0.0.4
 
@@ -762,7 +781,8 @@ Ping(e, r) : { ping! : List(U8) => Try({}, [Closed(Closure), ..e]), ..r }
 ## Frame-level access (send fragments and control frames, read raw frames).
 Frames(e, r) : { send_frame! : Frame => Try({}, [Closed(Closure), ..e]), receive_frame! : {} => Try(Frame, [Closed(Closure), ..e]), ..r }
 
-## A receive that gives up after a deadline without losing a message.
+## A receive that gives up after a total deadline since the call (Ping, Pong and
+## partial frames do not extend it) without losing a message.
 ## basic-cli: Connection.with_timeout (cli/Tcp.roc:157-170). cloudflare-workers: Io.timeout.
 ReceiveWithin(e, r) : { receive_within! : U64 => Try(Message, [TimedOut, Closed(Closure), ..e]), ..r }
 

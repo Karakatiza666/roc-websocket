@@ -115,13 +115,16 @@ Ws :: [].{
 	## A received frame that breaks the protocol fails the connection.
 	Frames(c, e, r) : { send_frame! : c, Frame => Try(c, Ws.Error(e)), receive_frame! : c => Try((c, Frame), Ws.Error(e)), ..r }
 
-	## A receive that waits at most `ms` milliseconds. `TimedOut` loses
-	## nothing.
+	## The next message, or `TimedOut` when `ms` milliseconds have passed
+	## since the call. The deadline bounds the whole call: Ping, Pong and
+	## partial frames do not extend it. An adapter that cannot bound the whole
+	## call leaves the field out. `TimedOut` loses nothing.
 	ReceiveWithin(c, e, r) : { receive_within! : c, U64 => Try((c, [Message(Ws.Message), TimedOut]), Ws.Error(e)), ..r }
 
-	## A receive that waits only as long as the platform's own read deadline
-	## (a fixed time the application does not choose), then gives `TimedOut`,
-	## as `ReceiveWithin` does. `TimedOut` loses nothing.
+	## An idle deadline: the next message, or `TimedOut` only when one read
+	## passes the platform's read deadline with no bytes. Any frame, a Ping
+	## included, restarts it, so `poll!` cannot be used to build a deadline for
+	## data messages (use `ReceiveWithin`). `TimedOut` loses nothing.
 	Poll(c, e, r) : { poll! : c => Try((c, [Message(Ws.Message), TimedOut]), Ws.Error(e)), ..r }
 
 	## The bytes queued for sending and not yet handed to the network.

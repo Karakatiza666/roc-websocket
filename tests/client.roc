@@ -28,6 +28,34 @@ fake_ops = {
 	random_bytes!: |f, n| Ok((f, List.repeat(7, n))),
 }
 
+## A link whose peer answers the handshake and then sends a Ping per read,
+## one second of a fake clock each, and never a data message. `until` is the
+## adapter-style total deadline kept in the link (the package has no clock of
+## its own, so the clock is a counter the link advances).
+Pinger : { now : U64, until : [At(U64), None], handshake_done : Bool, reads : U64 }
+
+pinger_ops : Client.Transport(Pinger, [])
+pinger_ops = {
+	write_bytes!: |p, _| Ok(p),
+	read_up_to!: |p, _| {
+		if !p.handshake_done {
+			return Ok(({ ..p, handshake_done: Bool.True }, Data(response(""))))
+		}
+		timed_out = match p.until {
+			At(t) => p.now >= t
+			None => Bool.False
+		}
+		if timed_out {
+			Ok((p, TimedOut))
+		} else if p.reads >= 10 {
+			Ok((p, End))
+		} else {
+			Ok(({ ..p, now: p.now + 1000, reads: p.reads + 1 }, Data(server(Frame.ping([1])))))
+		}
+	},
+	random_bytes!: |p, n| Ok((p, List.repeat(7, n))),
+}
+
 key : List(U8)
 key = List.repeat(7, 16)
 
@@ -223,6 +251,20 @@ main! = |_args| {
 	(ml2, late) = ok(ml1.receive!())
 	ml3 = ml2.map_link(|f| { ..f, written: f.written.append([]) })
 	check!("map_link changes the link and keeps the connection", late == Text("late") and ml3.link().written.len() == 2)
+	# A deadline kept in the link bounds the whole call: Ping frames count as
+	# progress for poll!, but the link's read gives TimedOut once the (fake)
+	# clock passes the deadline, so poll! gives TimedOut after three pings.
+	# This is how an adapter implements Ws.ReceiveWithin (map_link, poll!, map_link).
+	pinger = match Client.open!(pinger_ops, { now: 0, until: None, handshake_done: Bool.False, reads: 0 }, { url: "ws://example.com/" }) {
+		Ok(opened) => opened.conn
+		Err(e) => crash "open failed: ${Str.inspect(e)}"
+	}
+	limited = pinger.map_link(|p| { ..p, until: At(p.now + 3000) })
+	(after_limit, timed) = ok(limited.poll!())
+	check!("a link deadline gives TimedOut though Pings keep arriving", timed == TimedOut and after_limit.link().now == 3000)
+	check!("the call made three reads, one per Ping", after_limit.link().reads == 3)
+	# Without the deadline, the pings never produce a TimedOut: poll! runs to the end of the stream.
+	check!("without the deadline, Pings are progress and poll! does not time out", closed_with(pinger.poll!()) == Ok(Ws.dropped))
 	(_, raw) = ok(open!([Data(response("")), Data(server(Frame.pong([5])))]).receive_frame!())
 	check!("receive_frame! gives a Pong", raw == Frame.pong([5]))
 	Ok({})

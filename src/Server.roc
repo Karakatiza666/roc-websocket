@@ -68,8 +68,10 @@ Server :: [].{
 			Err(err) => Err(err)
 		}
 
-		## The next message, or `TimedOut` when the platform's read deadline
-		## passed with no message. Nothing is lost.
+		## An idle deadline: the next message, or `TimedOut` only when one read
+		## passes the platform's read deadline with no bytes. Any frame, a Ping
+		## included, restarts it, so it cannot bound the wait for a data message.
+		## Nothing is lost.
 		poll! : Server.Conn(b, e) => Try((Server.Conn(b, e), [Message(Ws.Message), TimedOut]), Server.Error(e))
 		poll! = |conn| match conn.session.poll!() {
 			Ok((session, got)) => Ok(({ ..conn, session }, got))
