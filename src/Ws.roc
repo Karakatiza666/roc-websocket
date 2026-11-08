@@ -212,7 +212,7 @@ Ws :: [].{
 	messages : { receive! : c => Try((c, Ws.Message), Ws.Error(e)), .. }, c -> Stream(Try(Ws.Message, Ws.Error(e)))
 	messages = |ops, conn| Stream.custom(
 		Going(conn),
-		Unknown,
+		Err(Unknown),
 		|state| match state {
 			Going(c) =>
 				match (ops.receive!)(c) {

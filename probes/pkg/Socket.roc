@@ -22,7 +22,7 @@ Socket :: {}.{
 	none = { ping: Unsupported, pong_seen: Unsupported }
 
 	messages : Socket.Conn -> Stream(Try(Socket.Message, Str))
-	messages = |conn| Stream.custom(conn, Unknown, |c| match (c.receive!)({}) {
+	messages = |conn| Stream.custom(conn, Err(Unknown), |c| match (c.receive!)({}) {
 		Ok(m) => Ok((Ok(m), c))
 		Err(Closed(_)) => Err(NoMore)
 		Err(Failed(why)) => Ok((Err(why), c))

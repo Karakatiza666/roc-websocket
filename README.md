@@ -37,7 +37,7 @@ Add the package to the header with its release URL. The release notes of each
 ```roc
 app [...] {
 	pf: platform "...",
-	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.5/AKLgwxjBQN2XkE4G5sZtzrjPSxhwo6XmJRSPdWhpgVUN.tar.zst",
+	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.6/6rcitHh7bVV7D4A2aubD6H6yLHUgtXLi6jRwxjomSwVv.tar.zst",
 }
 
 import ws.Ws
@@ -229,7 +229,7 @@ and `Ws.drive!` over a scripted link.
 
 ```sh
 ROC=/path/to/roc scripts/all_tests.sh   # fmt, check, expects, examples, tests/, docs
-ROC=/path/to/roc scripts/bundle.sh 0.0.5  # dist/<hash>.tar.zst and its release URL
+ROC=/path/to/roc scripts/bundle.sh 0.0.6  # dist/<hash>.tar.zst and its release URL
 ROC=/path/to/roc scripts/test_bundle.sh   # the examples and tests against the bundle
 ```
 
@@ -248,10 +248,16 @@ in memory.
 
 ## Changes
 
-### Unreleased
+### 0.0.6
 
-Documentation only, no type changes. The meaning of the two deadline features
-is now stated exactly:
+No type changes. The package now builds on Roc `nightly-2026-11-07-ad3a5d2`.
+
+| Change | Detail |
+| --- | --- |
+| Roc nightly | Pinned to `nightly-2026-11-07-ad3a5d2`. In this nightly, the size argument of `Stream.custom` is `Try(U64, [Unknown])`. `Ws.messages` passes `Err(Unknown)` as the size. Its type and behaviour do not change. |
+| Deadlines | The documentation states the meaning of the two deadline features. See the list below. |
+
+The meaning of the two deadline features:
 
 - `Ws.ReceiveWithin`: `receive_within!(c, ms)` is a total deadline. It gives
   `TimedOut` when `ms` milliseconds have passed since the call, whatever
@@ -338,7 +344,7 @@ Added, non-breaking: `Client.Conn.map_link : Conn(b, e), (b -> b) -> Conn(b, e)`
 function to the link value and keeps the protocol state (bytes read past a
 frame, a half-received message, a pending close). An adapter whose stream has a
 per-call read timeout can set it, then call `poll!`. (That bounds each read,
-not the call: see Unreleased, which says how to make the deadline total.)
+not the call: see 0.0.6, which says how to make the deadline total.)
 
 ### 0.0.3
 
