@@ -37,7 +37,7 @@ Add the package to the header with its release URL. The release notes of each
 ```roc
 app [...] {
 	pf: platform "...",
-	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.6/6rcitHh7bVV7D4A2aubD6H6yLHUgtXLi6jRwxjomSwVv.tar.zst",
+	ws: "https://github.com/Karakatiza666/roc-websocket/releases/download/0.0.7/EBNZjRmQ5PZiJAE5UMUFePtQFdb1FnsQX1qagVuiCwM9.tar.zst",
 }
 
 import ws.Ws
@@ -229,7 +229,7 @@ and `Ws.drive!` over a scripted link.
 
 ```sh
 ROC=/path/to/roc scripts/all_tests.sh   # fmt, check, expects, examples, tests/, docs
-ROC=/path/to/roc scripts/bundle.sh 0.0.6  # dist/<hash>.tar.zst and its release URL
+ROC=/path/to/roc scripts/bundle.sh 0.0.7  # dist/<hash>.tar.zst and its release URL
 ROC=/path/to/roc scripts/test_bundle.sh   # the examples and tests against the bundle
 ```
 
@@ -247,6 +247,15 @@ frames failing with 1002, Ping and Pong, a close by either side, the held echo,
 in memory.
 
 ## Changes
+
+### 0.0.7
+
+No type or call changes. The package now builds on Roc `nightly-2026-11-15-f25da45` with no warnings.
+
+| Change | Detail |
+| --- | --- |
+| Roc nightly | Pinned to `nightly-2026-11-15-f25da45`. This nightly warns when a local or a nested member has the name of a top-level definition. |
+| Names | `Protocol.new` takes `limit` (was `max_message`). `Session.start!` takes `first_link` (was `link`). `Server.Request` is an alias of a private top-level type, because its method `accept!` has the name of `Server.accept!`. Calls do not change. |
 
 ### 0.0.6
 
