@@ -33,8 +33,8 @@ Session(b, e) :: {
 	## bytes read after the handshake head. The frames those bytes provoke (a
 	## Pong, a Close) are written.
 	start! : Ws.Bytes(b, Session.Errors(e), {}), (b => Try((b, Frame.Masking), Session.Error(e))), b, Protocol, List(U8) => Try(Session(b, e), Session.Error(e))
-	start! = |bytes, mask!, link, protocol, rest| {
-		session = { bytes: bytes, mask!: mask!, link: link, protocol: protocol, inbox: [], held: [] }
+	start! = |bytes, mask!, first_link, protocol, rest| {
+		session = { bytes: bytes, mask!: mask!, link: first_link, protocol: protocol, inbox: [], held: [] }
 		apply_events!(session, protocol.receive(rest))
 	}
 

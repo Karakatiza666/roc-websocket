@@ -29,9 +29,9 @@ Protocol :: {
 	Event : [Message(Ws.Message), Write(Frame), Ping(List(U8)), Pong(List(U8)), Closed(Ws.Closure)]
 
 	## A protocol in the open state, for an endpoint of `role`, accepting
-	## messages of at most `max_message` bytes.
+	## messages of at most `limit` bytes.
 	new : [Client, Server], U64 -> Protocol
-	new = |role, max_message| { role, max_message, phase: Open, pending: [], partial: Idle }
+	new = |role, limit| { role, max_message: limit, phase: Open, pending: [], partial: Idle }
 
 	## Whether messages may still be sent: no Close was sent or received.
 	is_open : Protocol -> Bool

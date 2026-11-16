@@ -121,66 +121,7 @@ Server :: [].{
 	## An upgrade request read from the link and validated, not answered
 	## yet, from `Server.read_request!`. It keeps the bytes the client sent
 	## after the request head, the start of its first frames.
-	Request(b, e) :: { transport : Server.Transport(b, e), link : b, upgrade : Handshake.Upgrade, rest : List(U8) }.{
-
-		## The same request with its link value changed by `change`, for an
-		## adapter that reads the request with one deadline and runs the
-		## connection with another (a short handshake timeout, for example).
-		map_link : Server.Request(b, e), (b -> b) -> Server.Request(b, e)
-		map_link = |request, change| { ..request, link: change(request.link) }
-
-		## The request: its resource, `Host`, the subprotocols the client
-		## offered in order, and every header (names lowercased).
-		upgrade : Server.Request(b, e) -> Ws.Upgrade
-		upgrade = |request| {
-			u = request.upgrade
-			{ resource: u.resource, host: u.host, protocols: u.protocols, headers: u.headers }
-		}
-
-		## Accept the upgrade: write the 101 response with the first
-		## subprotocol of `options.protocols` that the client offered (the
-		## server's order of preference; none when nothing matches), and
-		## return the connection. No
-		## extension is accepted, so `extensions` is `Reported([])`. Bytes the
-		## client sent after its request are then read as frames.
-		##
-		## To choose a subprotocol another way, pick one from
-		## `request.upgrade().protocols` and pass `protocols: [chosen]`.
-		accept! : Server.Request(b, e), Ws.AcceptOptions => Try(Ws.Opened(Server.Conn(b, e)), Server.Error(e))
-		accept! = |request, options| {
-			offer = request.upgrade
-			protocol = Handshake.choose_protocol(offer, options.?protocols ?? [])
-			response = match Handshake.accept_response(offer, protocol, []) {
-				Ok(text) => text
-				Err(NotOffered(p)) => crash "Server.accept!: choose_protocol gave `${p}`, which the client did not offer"
-			}
-			link = (request.transport.write_bytes!)(request.link, response.to_utf8())?
-			mask! = |l| Ok((l, Unmasked))
-			max_message = options.?max_message ?? Server.default_max_message
-			session = Session.start!(request.transport, mask!, link, Protocol.new(Server, max_message), request.rest)?
-			Ok({ conn: Server.Conn.{ session }, protocol, extensions: Reported([]) })
-		}
-
-		## Refuse the upgrade: write a response with `refusal.status`, its
-		## headers and body, and give the link back for the adapter to close.
-		## Any final status is allowed (a 3xx with a `Location` header, a 401
-		## with `WWW-Authenticate`, a 4xx or 5xx). A status outside 200-599
-		## (a 1xx, 101 among them, which ends no exchange, or no HTTP status)
-		## is `InvalidStatus` and writes nothing.
-		##
-		## ```roc
-		## link = request.refuse!({ status: 403, body: "no access to ${request.upgrade().resource}" })?
-		## ```
-		refuse! : Server.Request(b, e), Ws.Refusal => Try(b, Server.Error(e))
-		refuse! = |request, refusal| {
-			status = refusal.status
-			if status < 200 or status > 599 {
-				return Err(InvalidStatus(status))
-			}
-			response = Handshake.refusal(status, refusal.?headers ?? [], refusal.?body ?? "")
-			(request.transport.write_bytes!)(request.link, response.to_utf8())
-		}
-	}
+	Request(b, e) : ServerRequest(b, e)
 
 	## The largest message accepted when the options do not say: 16 MiB.
 	default_max_message : U64
@@ -257,7 +198,7 @@ validate! = |transport, link, have, end| {
 		Err(_) => return refuse_bad!(transport, link, 400, "a request head that is not UTF-8")
 	}
 	match Handshake.parse_upgrade(head) {
-		Ok(upgrade) => Ok(Server.Request.{ transport, link, upgrade, rest: have.drop_first(end) })
+		Ok(upgrade) => Ok(ServerRequest.{ transport, link, upgrade, rest: have.drop_first(end) })
 		Err(Rejected({ status, why })) => refuse_bad!(transport, link, status, why)
 	}
 }
@@ -267,4 +208,67 @@ refuse_bad! : Server.Transport(b, e), b, U16, Str => Try(x, Server.Error(e))
 refuse_bad! = |transport, link, status, why| {
 	_ = (transport.write_bytes!)(link, Handshake.rejection(status, why).to_utf8())?
 	Err(NotUpgrade(why))
+}
+
+## The type of `Server.Request`. It is a private top-level type behind a
+## public alias, because its method `accept!` has the name of `Server.accept!`.
+ServerRequest(b, e) :: { transport : Server.Transport(b, e), link : b, upgrade : Handshake.Upgrade, rest : List(U8) }.{
+
+	## The same request with its link value changed by `change`, for an
+	## adapter that reads the request with one deadline and runs the
+	## connection with another (a short handshake timeout, for example).
+	map_link : Server.Request(b, e), (b -> b) -> Server.Request(b, e)
+	map_link = |request, change| { ..request, link: change(request.link) }
+
+	## The request: its resource, `Host`, the subprotocols the client
+	## offered in order, and every header (names lowercased).
+	upgrade : Server.Request(b, e) -> Ws.Upgrade
+	upgrade = |request| {
+		u = request.upgrade
+		{ resource: u.resource, host: u.host, protocols: u.protocols, headers: u.headers }
+	}
+
+	## Accept the upgrade: write the 101 response with the first
+	## subprotocol of `options.protocols` that the client offered (the
+	## server's order of preference; none when nothing matches), and
+	## return the connection. No
+	## extension is accepted, so `extensions` is `Reported([])`. Bytes the
+	## client sent after its request are then read as frames.
+	##
+	## To choose a subprotocol another way, pick one from
+	## `request.upgrade().protocols` and pass `protocols: [chosen]`.
+	accept! : Server.Request(b, e), Ws.AcceptOptions => Try(Ws.Opened(Server.Conn(b, e)), Server.Error(e))
+	accept! = |request, options| {
+		offer = request.upgrade
+		protocol = Handshake.choose_protocol(offer, options.?protocols ?? [])
+		response = match Handshake.accept_response(offer, protocol, []) {
+			Ok(text) => text
+			Err(NotOffered(p)) => crash "Server.accept!: choose_protocol gave `${p}`, which the client did not offer"
+		}
+		link = (request.transport.write_bytes!)(request.link, response.to_utf8())?
+		mask! = |l| Ok((l, Unmasked))
+		max_message = options.?max_message ?? Server.default_max_message
+		session = Session.start!(request.transport, mask!, link, Protocol.new(Server, max_message), request.rest)?
+		Ok({ conn: Server.Conn.{ session }, protocol, extensions: Reported([]) })
+	}
+
+	## Refuse the upgrade: write a response with `refusal.status`, its
+	## headers and body, and give the link back for the adapter to close.
+	## Any final status is allowed (a 3xx with a `Location` header, a 401
+	## with `WWW-Authenticate`, a 4xx or 5xx). A status outside 200-599
+	## (a 1xx, 101 among them, which ends no exchange, or no HTTP status)
+	## is `InvalidStatus` and writes nothing.
+	##
+	## ```roc
+	## link = request.refuse!({ status: 403, body: "no access to ${request.upgrade().resource}" })?
+	## ```
+	refuse! : Server.Request(b, e), Ws.Refusal => Try(b, Server.Error(e))
+	refuse! = |request, refusal| {
+		status = refusal.status
+		if status < 200 or status > 599 {
+			return Err(InvalidStatus(status))
+		}
+		response = Handshake.refusal(status, refusal.?headers ?? [], refusal.?body ?? "")
+		(request.transport.write_bytes!)(request.link, response.to_utf8())
+	}
 }
